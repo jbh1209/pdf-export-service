@@ -24,13 +24,13 @@ const authMiddleware = (req, res, next) => {
     console.error('[Auth] API_SECRET not configured');
     return res.status(500).json({ error: 'Server misconfigured' });
   }
-  
+
   const providedKey = req.headers['x-api-key'];
   if (!providedKey || providedKey !== API_SECRET) {
     console.warn('[Auth] Invalid or missing API key');
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  
+
   next();
 };
 
@@ -39,7 +39,7 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
-  
+
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
@@ -51,14 +51,12 @@ app.use((req, res, next) => {
 // =============================================================================
 
 app.get('/health', (req, res) => {
-  // Verify Ghostscript is available
   try {
     const gsVersion = execSync('gs --version', { encoding: 'utf8' }).trim();
-    
-    // Check ICC profiles exist
+
     const gracolExists = fs.existsSync(PROFILES.gracol);
     const fogra39Exists = fs.existsSync(PROFILES.fogra39);
-    
+
     res.json({
       status: 'healthy',
       ghostscript: gsVersion,
@@ -80,36 +78,34 @@ app.get('/health', (req, res) => {
 // CMYK CONVERSION ENDPOINT
 // =============================================================================
 
-app.post('/convert-cmyk', 
+app.post(
+  '/convert-cmyk',
   authMiddleware,
   express.raw({ type: 'application/pdf', limit: '100mb' }),
   async (req, res) => {
     const startTime = Date.now();
     const profile = req.query.profile === 'fogra39' ? 'fogra39' : 'gracol';
     const profilePath = PROFILES[profile];
-    
+
     console.log(`[Convert] Starting CMYK conversion with profile: ${profile}`);
-    
+
     if (!req.body || req.body.length === 0) {
       return res.status(400).json({ error: 'No PDF data provided' });
     }
-    
+
     if (!fs.existsSync(profilePath)) {
       console.error(`[Convert] ICC profile not found: ${profilePath}`);
       return res.status(500).json({ error: `ICC profile not found: ${profile}` });
     }
-    
-    // Create temp directory for this conversion
+
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmyk-'));
     const inputPath = path.join(tempDir, 'input.pdf');
     const outputPath = path.join(tempDir, 'output.pdf');
-    
+
     try {
-      // Write input PDF
       fs.writeFileSync(inputPath, req.body);
       console.log(`[Convert] Input PDF: ${req.body.length} bytes`);
-      
-      // Run Ghostscript CMYK conversion
+
       const gsCommand = [
         'gs',
         '-dBATCH',
@@ -124,31 +120,28 @@ app.post('/convert-cmyk',
         `-sOutputFile=${outputPath}`,
         inputPath
       ].join(' ');
-      
-      console.log(`[Convert] Running Ghostscript...`);
-      execSync(gsCommand, { 
+
+      console.log('[Convert] Running Ghostscript...');
+      execSync(gsCommand, {
         encoding: 'utf8',
-        maxBuffer: 50 * 1024 * 1024 // 50MB buffer for logs
+        maxBuffer: 50 * 1024 * 1024
       });
-      
-      // Read and return output
+
       const cmykPdf = fs.readFileSync(outputPath);
       const duration = Date.now() - startTime;
-      
+
       console.log(`[Convert] Success: ${cmykPdf.length} bytes in ${duration}ms`);
-      
+
       res.set('Content-Type', 'application/pdf');
       res.set('X-Conversion-Time-Ms', duration.toString());
       res.send(cmykPdf);
-      
     } catch (error) {
       console.error('[Convert] Ghostscript error:', error.message);
-      res.status(500).json({ 
+      res.status(500).json({
         error: 'CMYK conversion failed',
-        details: error.message 
+        details: error.message
       });
     } finally {
-      // Cleanup temp files
       try {
         fs.rmSync(tempDir, { recursive: true, force: true });
       } catch (e) {
@@ -162,33 +155,32 @@ app.post('/convert-cmyk',
 // BATCH CONVERSION ENDPOINT
 // =============================================================================
 
-app.post('/batch-convert-cmyk',
+app.post(
+  '/batch-convert-cmyk',
   authMiddleware,
   express.json({ limit: '200mb' }),
   async (req, res) => {
     const startTime = Date.now();
     const { pdfs, profile = 'gracol' } = req.body;
-    
+
     if (!Array.isArray(pdfs) || pdfs.length === 0) {
       return res.status(400).json({ error: 'No PDFs provided' });
     }
-    
+
     console.log(`[Batch] Converting ${pdfs.length} PDFs with profile: ${profile}`);
-    
+
     const profilePath = PROFILES[profile] || PROFILES.gracol;
     const results = [];
-    
+
     for (let i = 0; i < pdfs.length; i++) {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmyk-batch-'));
       const inputPath = path.join(tempDir, 'input.pdf');
       const outputPath = path.join(tempDir, 'output.pdf');
-      
+
       try {
-        // Decode base64 PDF
         const pdfBuffer = Buffer.from(pdfs[i], 'base64');
         fs.writeFileSync(inputPath, pdfBuffer);
-        
-        // Run Ghostscript
+
         const gsCommand = [
           'gs',
           '-dBATCH',
@@ -203,18 +195,16 @@ app.post('/batch-convert-cmyk',
           `-sOutputFile=${outputPath}`,
           inputPath
         ].join(' ');
-        
+
         execSync(gsCommand, { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
-        
-        // Read output and encode as base64
+
         const cmykPdf = fs.readFileSync(outputPath);
         results.push({
           success: true,
           data: cmykPdf.toString('base64')
         });
-        
+
         console.log(`[Batch] Converted ${i + 1}/${pdfs.length}`);
-        
       } catch (error) {
         console.error(`[Batch] Error on PDF ${i + 1}:`, error.message);
         results.push({
@@ -227,10 +217,12 @@ app.post('/batch-convert-cmyk',
         } catch (e) {}
       }
     }
-    
+
     const duration = Date.now() - startTime;
-    console.log(`[Batch] Complete: ${results.filter(r => r.success).length}/${pdfs.length} successful in ${duration}ms`);
-    
+    console.log(
+      `[Batch] Complete: ${results.filter((r) => r.success).length}/${pdfs.length} successful in ${duration}ms`
+    );
+
     res.json({
       success: true,
       results,
@@ -245,19 +237,17 @@ app.post('/batch-convert-cmyk',
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`CMYK Conversion Service running on port ${PORT}`);
-  console.log(`API_SECRET configured: ${API_SECRET ? 'Yes' : 'NO - AUTH DISABLED!'}`);
-  
-  // Verify Ghostscript on startup
+  console.log(`API_SECRET configured: ${API_SECRET ? 'Yes' : 'NO (server will return 500 on authed routes)'}`);
+
   try {
     const gsVersion = execSync('gs --version', { encoding: 'utf8' }).trim();
     console.log(`Ghostscript version: ${gsVersion}`);
   } catch (e) {
     console.error('WARNING: Ghostscript not found!');
   }
-  
-  // Verify ICC profiles on startup
-  Object.entries(PROFILES).forEach(([name, path]) => {
-    const exists = fs.existsSync(path);
+
+  Object.entries(PROFILES).forEach(([name, p]) => {
+    const exists = fs.existsSync(p);
     console.log(`ICC Profile ${name}: ${exists ? 'Found' : 'MISSING!'}`);
   });
 });
