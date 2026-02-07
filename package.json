@@ -7,7 +7,7 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "@polotno/pdf-export": "^1.0.0",
+    "@polotno/pdf-export": "^0.1.36",
     "@supabase/supabase-js": "^2.81.1",
     "express": "^4.18.2",
     "express-rate-limit": "^7.1.5"
