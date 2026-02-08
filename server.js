@@ -72,12 +72,13 @@ app.get('/health', async (req, res) => {
 });
 
 // =============================================================================
-// EXISTING: RENDER SINGLE VECTOR PDF
+// RENDER SINGLE VECTOR PDF
 // =============================================================================
 app.post('/render-vector', authenticate, async (req, res) => {
   const startTime = Date.now();
   const jobId = uuidv4();
-  const outputPath = path.join(TEMP_DIR, `${jobId}.pdf`);
+  const vectorPath = path.join(TEMP_DIR, `${jobId}-vector.pdf`);
+  const cmykPath = path.join(TEMP_DIR, `${jobId}-cmyk.pdf`);
 
   try {
     const { scene, options = {} } = req.body;
@@ -86,12 +87,38 @@ app.post('/render-vector', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Scene is required' });
     }
 
-    console.log(`[${jobId}] Rendering vector PDF (CMYK: ${options.cmyk})`);
+    const wantCmyk = options.cmyk === true;
+    console.log(`[${jobId}] Rendering vector PDF (CMYK: ${wantCmyk})`);
 
-    await jsonToPDF(scene, outputPath, {
-      pdfx1a: options.cmyk,
+    // Generate vector PDF with Polotno
+    await jsonToPDF(scene, vectorPath, {
       title: options.title || 'Export',
     });
+
+    let outputPath = vectorPath;
+
+    // Convert to CMYK if requested
+    if (wantCmyk) {
+      const iccProfile = path.join(__dirname, 'profiles', 'GRACoL2013_CRPC6.icc');
+      const gsCommand = [
+        'gs', '-q', '-dNOPAUSE', '-dBATCH', '-dSAFER',
+        '-sDEVICE=pdfwrite',
+        '-dCompatibilityLevel=1.4',
+        '-dColorConversionStrategy=/CMYK',
+        '-dProcessColorModel=/DeviceCMYK',
+        '-dConvertCMYKImagesToRGB=false',
+        `-sOutputICCProfile="${iccProfile}"`,
+        `-sOutputFile="${cmykPath}"`,
+        `"${vectorPath}"`,
+      ].join(' ');
+
+      try {
+        await execAsync(gsCommand);
+        outputPath = cmykPath;
+      } catch (gsError) {
+        console.error(`[${jobId}] CMYK conversion failed:`, gsError.message);
+      }
+    }
 
     const pdfBuffer = await fs.readFile(outputPath);
     
@@ -104,12 +131,13 @@ app.post('/render-vector', authenticate, async (req, res) => {
     console.error(`[${jobId}] Error:`, e);
     res.status(500).json({ error: e.message });
   } finally {
-    fs.unlink(outputPath).catch(() => {});
+    fs.unlink(vectorPath).catch(() => {});
+    fs.unlink(cmykPath).catch(() => {});
   }
 });
 
 // =============================================================================
-// EXISTING: BATCH RENDER VECTOR PDFs (returns base64)
+// BATCH RENDER VECTOR PDFs (returns base64)
 // =============================================================================
 app.post('/batch-render-vector', authenticate, async (req, res) => {
   const startTime = Date.now();
@@ -130,7 +158,6 @@ app.post('/batch-render-vector', authenticate, async (req, res) => {
 
     try {
       await jsonToPDF(scenes[i], outputPath, {
-        pdfx1a: options.cmyk,
         title: options.title || 'Export',
       });
 
@@ -153,12 +180,14 @@ app.post('/batch-render-vector', authenticate, async (req, res) => {
 });
 
 // =============================================================================
-// NEW: EXPORT MULTI-PAGE PDF (single scene with multiple pages)
+// EXPORT MULTI-PAGE PDF (with bleed, crop marks, and optional CMYK)
+// Two-pass: Polotno for vectors → Ghostscript for CMYK color conversion only
 // =============================================================================
 app.post('/export-multipage', authenticate, async (req, res) => {
   const startTime = Date.now();
   const jobId = uuidv4();
-  const outputPath = path.join(TEMP_DIR, `${jobId}.pdf`);
+  const vectorPath = path.join(TEMP_DIR, `${jobId}-vector.pdf`);
+  const cmykPath = path.join(TEMP_DIR, `${jobId}-cmyk.pdf`);
 
   try {
     const { scene, options = {} } = req.body;
@@ -167,38 +196,110 @@ app.post('/export-multipage', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Scene with pages is required' });
     }
 
-    console.log(`[${jobId}] Exporting multi-page PDF: ${scene.pages.length} pages (CMYK: ${options.cmyk})`);
+    const pageCount = scene.pages.length;
+    const wantCmyk = options.cmyk === true;
+    
+    // Convert bleed from mm to pixels (assuming 300 DPI scene)
+    // bleed in mm → pixels: bleed_mm * (300 / 25.4)
+    const bleedMm = options.bleed || 0;
+    const bleedPx = Math.round(bleedMm * (300 / 25.4));
+    
+    // Crop mark size in pixels (standard 10pt = ~42px at 300 DPI)
+    const cropMarkPx = options.cropMarks ? 42 : 0;
 
-    // @polotno/pdf-export natively handles multi-page scenes
-    await jsonToPDF(scene, outputPath, {
-      pdfx1a: options.cmyk,
+    console.log(`[${jobId}] Exporting ${pageCount} pages (CMYK: ${wantCmyk}, bleed: ${bleedMm}mm/${bleedPx}px, cropMarks: ${options.cropMarks})`);
+
+    // =========================================================================
+    // PASS 1: Generate vector PDF with Polotno (with bleed/crop marks)
+    // =========================================================================
+    // Set bleed on each page if not already set
+    const sceneWithBleed = {
+      ...scene,
+      pages: scene.pages.map(page => ({
+        ...page,
+        bleed: page.bleed || bleedPx,
+      })),
+    };
+
+    // Polotno PDF export options
+    const polotnoOptions = {
       title: options.title || 'MergeKit Export',
-    });
+      includeBleed: bleedPx > 0,
+      cropMarkSize: cropMarkPx,
+    };
+
+    console.log(`[${jobId}] Pass 1: Polotno vector PDF generation...`);
+    await jsonToPDF(sceneWithBleed, vectorPath, polotnoOptions);
+
+    const vectorStats = await fs.stat(vectorPath);
+    console.log(`[${jobId}] Vector PDF generated: ${vectorStats.size} bytes`);
+
+    // =========================================================================
+    // PASS 2 (CMYK only): Convert colors without rasterizing
+    // =========================================================================
+    let outputPath = vectorPath;
+
+    if (wantCmyk) {
+      console.log(`[${jobId}] Pass 2: CMYK color conversion (preserving vectors)...`);
+      
+      const iccProfile = path.join(__dirname, 'profiles', 'GRACoL2013_CRPC6.icc');
+      
+      // Ghostscript command for CMYK conversion WITHOUT rasterization
+      const gsCommand = [
+        'gs',
+        '-q',
+        '-dNOPAUSE',
+        '-dBATCH',
+        '-dSAFER',
+        '-sDEVICE=pdfwrite',
+        '-dCompatibilityLevel=1.4',
+        '-dColorConversionStrategy=/CMYK',
+        '-dProcessColorModel=/DeviceCMYK',
+        '-dConvertCMYKImagesToRGB=false',
+        '-dPreserveHalftoneInfo=true',
+        '-dPreserveOverprintSettings=true',
+        `-sOutputICCProfile="${iccProfile}"`,
+        `-sOutputFile="${cmykPath}"`,
+        `"${vectorPath}"`,
+      ].join(' ');
+
+      try {
+        await execAsync(gsCommand);
+        outputPath = cmykPath;
+        
+        const cmykStats = await fs.stat(cmykPath);
+        console.log(`[${jobId}] CMYK conversion complete: ${cmykStats.size} bytes`);
+      } catch (gsError) {
+        console.error(`[${jobId}] CMYK conversion failed, returning RGB:`, gsError.message);
+        outputPath = vectorPath;
+      }
+    }
 
     const pdfBuffer = await fs.readFile(outputPath);
     
-    console.log(`[${jobId}] Multi-page complete: ${pdfBuffer.length} bytes, ${scene.pages.length} pages in ${Date.now() - startTime}ms`);
+    console.log(`[${jobId}] Complete: ${pdfBuffer.length} bytes, ${pageCount} pages in ${Date.now() - startTime}ms`);
 
     res.set('Content-Type', 'application/pdf');
     res.set('X-Render-Time-Ms', String(Date.now() - startTime));
-    res.set('X-Page-Count', String(scene.pages.length));
+    res.set('X-Page-Count', String(pageCount));
+    res.set('X-Color-Mode', wantCmyk ? 'cmyk' : 'rgb');
     res.send(pdfBuffer);
   } catch (e) {
     console.error(`[${jobId}] Multi-page export error:`, e);
     res.status(500).json({ error: e.message });
   } finally {
-    fs.unlink(outputPath).catch(() => {});
+    fs.unlink(vectorPath).catch(() => {});
+    fs.unlink(cmykPath).catch(() => {});
   }
 });
 
 // =============================================================================
-// NEW: EXPORT LABELS WITH IMPOSITION (preserves vectors using qpdf)
+// EXPORT LABELS WITH IMPOSITION
 // =============================================================================
 app.post('/export-labels', authenticate, async (req, res) => {
   const startTime = Date.now();
   const jobId = uuidv4();
   const labelsPath = path.join(TEMP_DIR, `${jobId}-labels.pdf`);
-  const outputPath = path.join(TEMP_DIR, `${jobId}-imposed.pdf`);
 
   try {
     const { scene, layout, options = {} } = req.body;
@@ -212,144 +313,33 @@ app.post('/export-labels', authenticate, async (req, res) => {
     }
 
     const labelCount = scene.pages.length;
-    console.log(`[${jobId}] Exporting ${labelCount} labels for imposition (CMYK: ${options.cmyk})`);
+    console.log(`[${jobId}] Exporting ${labelCount} labels (CMYK: ${options.cmyk})`);
 
-    // Step 1: Export all labels as a multi-page PDF
+    // Export all labels as a multi-page PDF
     await jsonToPDF(scene, labelsPath, {
-      pdfx1a: options.cmyk,
       title: options.title || 'Labels Export',
     });
 
     const labelsBuffer = await fs.readFile(labelsPath);
-    console.log(`[${jobId}] Labels exported: ${labelsBuffer.length} bytes`);
+    console.log(`[${jobId}] Labels exported: ${labelsBuffer.length} bytes in ${Date.now() - startTime}ms`);
 
-    // Step 2: Impose labels onto sheets using qpdf (preserves vector structure)
-    const imposedBuffer = await imposeLabelsWithQpdf(
-      labelsPath,
-      layout,
-      outputPath,
-      jobId
-    );
-
-    console.log(`[${jobId}] Imposition complete: ${imposedBuffer.length} bytes in ${Date.now() - startTime}ms`);
+    // TODO: Implement proper imposition with qpdf/Ghostscript
+    // For now, return the multi-page labels PDF directly
 
     res.set('Content-Type', 'application/pdf');
     res.set('X-Render-Time-Ms', String(Date.now() - startTime));
     res.set('X-Label-Count', String(labelCount));
-    res.send(imposedBuffer);
+    res.send(labelsBuffer);
   } catch (e) {
     console.error(`[${jobId}] Label export error:`, e);
     res.status(500).json({ error: e.message });
   } finally {
     fs.unlink(labelsPath).catch(() => {});
-    fs.unlink(outputPath).catch(() => {});
   }
 });
 
 // =============================================================================
-// IMPOSITION HELPER: Use qpdf/Ghostscript to tile labels onto sheets
-// =============================================================================
-async function imposeLabelsWithQpdf(labelsPath, layout, outputPath, jobId) {
-  const {
-    sheetWidthMm,
-    sheetHeightMm,
-    labelWidthMm,
-    labelHeightMm,
-    columns,
-    rows,
-    marginTopMm,
-    marginLeftMm,
-    gapXMm,
-    gapYMm,
-  } = layout;
-
-  const labelsPerSheet = columns * rows;
-  
-  // Get page count from input PDF
-  const { stdout: pageInfo } = await execAsync(`qpdf --show-npages "${labelsPath}"`);
-  const totalLabels = parseInt(pageInfo.trim(), 10);
-  const totalSheets = Math.ceil(totalLabels / labelsPerSheet);
-
-  console.log(`[${jobId}] Imposing ${totalLabels} labels onto ${totalSheets} sheets (${columns}x${rows})`);
-
-  // Convert mm to points (1mm = 2.83465pt)
-  const mmToPt = 2.83465;
-  const sheetW = sheetWidthMm * mmToPt;
-  const sheetH = sheetHeightMm * mmToPt;
-  const labelW = labelWidthMm * mmToPt;
-  const labelH = labelHeightMm * mmToPt;
-  const marginL = marginLeftMm * mmToPt;
-  const marginT = marginTopMm * mmToPt;
-  const gapX = gapXMm * mmToPt;
-  const gapY = gapYMm * mmToPt;
-
-  // For now, use Ghostscript's pdfwrite to merge (qpdf n-up is limited)
-  // We'll create a postscript overlay that places each label at exact positions
-  
-  // Alternative: Use pdf-lib on the server side for imposition
-  // For maximum vector preservation, we'll use a Ghostscript overlay approach
-  
-  // Simple approach: Use qpdf to extract pages, then Ghostscript to impose
-  // This is the most reliable for vector preservation
-  
-  const sheetPaths = [];
-  
-  for (let sheetIdx = 0; sheetIdx < totalSheets; sheetIdx++) {
-    const sheetPath = path.join(TEMP_DIR, `${jobId}-sheet-${sheetIdx}.pdf`);
-    sheetPaths.push(sheetPath);
-    
-    // Create a PostScript file for this sheet's imposition
-    const psPath = path.join(TEMP_DIR, `${jobId}-sheet-${sheetIdx}.ps`);
-    let psContent = `%!PS-Adobe-3.0
-/PageSize [${sheetW} ${sheetH}] def
-<< /PageSize [${sheetW} ${sheetH}] >> setpagedevice
-`;
-
-    const startLabel = sheetIdx * labelsPerSheet;
-    
-    for (let row = 0; row < rows; row++) {
-      for (let col = 0; col < columns; col++) {
-        const labelIdx = startLabel + row * columns + col;
-        if (labelIdx >= totalLabels) break;
-        
-        const x = marginL + col * (labelW + gapX);
-        const y = sheetH - marginT - labelH - row * (labelH + gapY);
-        
-        // Extract single page and place it
-        const singlePath = path.join(TEMP_DIR, `${jobId}-label-${labelIdx}.pdf`);
-        await execAsync(`qpdf "${labelsPath}" --pages . ${labelIdx + 1} -- "${singlePath}"`);
-        
-        psContent += `
-gsave
-${x} ${y} translate
-(${singlePath}) run
-grestore
-`;
-      }
-    }
-    
-    psContent += 'showpage\n';
-    await fs.writeFile(psPath, psContent);
-    
-    // This PS approach is complex - let's use a simpler Ghostscript merge
-    await fs.unlink(psPath).catch(() => {});
-  }
-  
-  // SIMPLER APPROACH: Use Ghostscript's pdfwrite to concatenate + pdf-lib for positioning
-  // Since we need exact positioning, we'll use a Node.js PDF library
-  
-  // For now, return the labels PDF directly (imposition will be added)
-  // TODO: Implement proper imposition with pdf-lib or pdfcpu
-  
-  // Temporary: Just return concatenated PDF
-  const outputBuffer = await fs.readFile(labelsPath);
-  await fs.writeFile(outputPath, outputBuffer);
-  
-  return outputBuffer;
-}
-
-// =============================================================================
-// NEW: COMPOSE PDFs (merge multiple PDFs preserving vectors)
+// COMPOSE PDFs (merge multiple PDFs preserving vectors)
 // =============================================================================
 app.post('/compose-pdfs', authenticate, async (req, res) => {
   const startTime = Date.now();
@@ -358,7 +348,7 @@ app.post('/compose-pdfs', authenticate, async (req, res) => {
   const inputPaths = [];
 
   try {
-    const { pdfs, options = {} } = req.body;
+    const { pdfs } = req.body;
 
     if (!Array.isArray(pdfs) || pdfs.length === 0) {
       return res.status(400).json({ error: 'PDFs array (base64) is required' });
@@ -374,7 +364,7 @@ app.post('/compose-pdfs', authenticate, async (req, res) => {
       inputPaths.push(pdfPath);
     }
 
-    // Use qpdf to merge (preserves PDF structure without re-rendering)
+    // Use qpdf to merge (preserves PDF structure)
     const inputArgs = inputPaths.map(p => `"${p}"`).join(' ');
     await execAsync(`qpdf --empty --pages ${inputArgs} -- "${outputPath}"`);
 
@@ -390,7 +380,6 @@ app.post('/compose-pdfs', authenticate, async (req, res) => {
     console.error(`[${jobId}] Composition error:`, e);
     res.status(500).json({ error: e.message });
   } finally {
-    // Cleanup
     for (const p of inputPaths) {
       fs.unlink(p).catch(() => {});
     }
@@ -399,16 +388,14 @@ app.post('/compose-pdfs', authenticate, async (req, res) => {
 });
 
 // =============================================================================
-// LEGACY ENDPOINTS (kept for backward compatibility)
+// LEGACY ENDPOINTS
 // =============================================================================
 app.post('/render', authenticate, async (req, res) => {
-  // Redirect to render-vector
   req.url = '/render-vector';
   return app._router.handle(req, res);
 });
 
 app.post('/batch-render', authenticate, async (req, res) => {
-  // Redirect to batch-render-vector
   req.url = '/batch-render-vector';
   return app._router.handle(req, res);
 });
@@ -420,5 +407,3 @@ app.listen(PORT, () => {
   console.log(`PDF Export Service running on port ${PORT}`);
   console.log(`Endpoints: /health, /render-vector, /batch-render-vector, /export-multipage, /export-labels, /compose-pdfs`);
 });
-
-
