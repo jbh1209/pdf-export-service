@@ -3,7 +3,7 @@ import cors from 'cors';
 import path from 'path';
 import { promises as fs } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
-import { jsonToPDF, jsonToPDFBase64 } from '@polotno/pdf-export';
+import { jsonToPDF } from '@polotno/pdf-export';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
