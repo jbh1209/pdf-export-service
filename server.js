@@ -44,6 +44,166 @@ function authenticate(req, res, next) {
 }
 
 // =============================================================================
+// CROP MARK INJECTION HELPER
+// =============================================================================
+
+/**
+ * Generate crop mark line elements for a single corner
+ * @param {string} corner - 'tl' | 'tr' | 'bl' | 'br'
+ * @param {number} trimWidth - Page width (trim box)
+ * @param {number} trimHeight - Page height (trim box)
+ * @param {number} bleed - Bleed extension in pixels
+ * @param {number} markLength - Length of crop mark lines in pixels
+ * @param {number} markOffset - Gap between trim edge and mark start in pixels
+ * @returns {Array} Two line elements for this corner
+ */
+function generateCornerCropMarks(corner, trimWidth, trimHeight, bleed, markLength, markOffset) {
+  const strokeWidth = 0.75; // ~0.25pt at 300 DPI
+  const stroke = '#000000'; // Registration black
+  
+  // Calculate positions based on corner
+  let hLine, vLine;
+  
+  switch (corner) {
+    case 'tl': // Top-left
+      hLine = {
+        id: `crop-${corner}-h-${uuidv4().slice(0, 8)}`,
+        type: 'line',
+        x: -markOffset - markLength,
+        y: 0,
+        width: markLength,
+        height: 0,
+        stroke,
+        strokeWidth,
+      };
+      vLine = {
+        id: `crop-${corner}-v-${uuidv4().slice(0, 8)}`,
+        type: 'line',
+        x: 0,
+        y: -markOffset - markLength,
+        width: 0,
+        height: markLength,
+        stroke,
+        strokeWidth,
+      };
+      break;
+      
+    case 'tr': // Top-right
+      hLine = {
+        id: `crop-${corner}-h-${uuidv4().slice(0, 8)}`,
+        type: 'line',
+        x: trimWidth + markOffset,
+        y: 0,
+        width: markLength,
+        height: 0,
+        stroke,
+        strokeWidth,
+      };
+      vLine = {
+        id: `crop-${corner}-v-${uuidv4().slice(0, 8)}`,
+        type: 'line',
+        x: trimWidth,
+        y: -markOffset - markLength,
+        width: 0,
+        height: markLength,
+        stroke,
+        strokeWidth,
+      };
+      break;
+      
+    case 'bl': // Bottom-left
+      hLine = {
+        id: `crop-${corner}-h-${uuidv4().slice(0, 8)}`,
+        type: 'line',
+        x: -markOffset - markLength,
+        y: trimHeight,
+        width: markLength,
+        height: 0,
+        stroke,
+        strokeWidth,
+      };
+      vLine = {
+        id: `crop-${corner}-v-${uuidv4().slice(0, 8)}`,
+        type: 'line',
+        x: 0,
+        y: trimHeight + markOffset,
+        width: 0,
+        height: markLength,
+        stroke,
+        strokeWidth,
+      };
+      break;
+      
+    case 'br': // Bottom-right
+      hLine = {
+        id: `crop-${corner}-h-${uuidv4().slice(0, 8)}`,
+        type: 'line',
+        x: trimWidth + markOffset,
+        y: trimHeight,
+        width: markLength,
+        height: 0,
+        stroke,
+        strokeWidth,
+      };
+      vLine = {
+        id: `crop-${corner}-v-${uuidv4().slice(0, 8)}`,
+        type: 'line',
+        x: trimWidth,
+        y: trimHeight + markOffset,
+        width: 0,
+        height: markLength,
+        stroke,
+        strokeWidth,
+      };
+      break;
+  }
+  
+  return [hLine, vLine];
+}
+
+/**
+ * Inject crop mark elements into the scene JSON
+ * @param {Object} scene - Polotno scene JSON
+ * @param {number} bleedPx - Bleed in pixels
+ * @param {boolean} enableCropMarks - Whether to add crop marks
+ * @returns {Object} Modified scene with crop marks
+ */
+function injectCropMarks(scene, bleedPx, enableCropMarks) {
+  if (!enableCropMarks || !scene.pages) {
+    return scene;
+  }
+  
+  // Crop mark dimensions at 300 DPI
+  // Mark length: 10mm ≈ 118px (10 * 300 / 25.4)
+  // Mark offset: 3mm ≈ 35px (3 * 300 / 25.4)
+  const markLength = Math.round(10 * (300 / 25.4)); // ~118px
+  const markOffset = Math.round(3 * (300 / 25.4));  // ~35px
+  
+  const modifiedPages = scene.pages.map((page, pageIndex) => {
+    const trimWidth = page.width;
+    const trimHeight = page.height;
+    const bleed = page.bleed || bleedPx;
+    
+    // Generate crop marks for all four corners
+    const cropMarkElements = [
+      ...generateCornerCropMarks('tl', trimWidth, trimHeight, bleed, markLength, markOffset),
+      ...generateCornerCropMarks('tr', trimWidth, trimHeight, bleed, markLength, markOffset),
+      ...generateCornerCropMarks('bl', trimWidth, trimHeight, bleed, markLength, markOffset),
+      ...generateCornerCropMarks('br', trimWidth, trimHeight, bleed, markLength, markOffset),
+    ];
+    
+    console.log(`[crop-marks] Page ${pageIndex + 1}: Added ${cropMarkElements.length} crop mark elements`);
+    
+    return {
+      ...page,
+      children: [...(page.children || []), ...cropMarkElements],
+    };
+  });
+  
+  return { ...scene, pages: modifiedPages };
+}
+
+// =============================================================================
 // HEALTH CHECK
 // =============================================================================
 app.get('/health', async (req, res) => {
@@ -65,6 +225,7 @@ app.get('/health', async (req, res) => {
       ghostscript: gsVersion.trim(),
       icc: { gracol, fogra },
       polotno: '@polotno/pdf-export available',
+      cropMarks: 'vector injection supported',
     });
   } catch (e) {
     res.status(500).json({ status: 'error', error: e.message });
@@ -198,21 +359,18 @@ app.post('/export-multipage', authenticate, async (req, res) => {
 
     const pageCount = scene.pages.length;
     const wantCmyk = options.cmyk === true;
+    const wantCropMarks = options.cropMarks === true;
     
     // Convert bleed from mm to pixels (assuming 300 DPI scene)
     // bleed in mm → pixels: bleed_mm * (300 / 25.4)
     const bleedMm = options.bleed || 0;
     const bleedPx = Math.round(bleedMm * (300 / 25.4));
-    
-    // Crop mark size in pixels (standard 10pt = ~42px at 300 DPI)
-    const cropMarkPx = options.cropMarks ? 42 : 0;
 
-    console.log(`[${jobId}] Exporting ${pageCount} pages (CMYK: ${wantCmyk}, bleed: ${bleedMm}mm/${bleedPx}px, cropMarks: ${options.cropMarks})`);
+    console.log(`[${jobId}] Exporting ${pageCount} pages (CMYK: ${wantCmyk}, bleed: ${bleedMm}mm/${bleedPx}px, cropMarks: ${wantCropMarks})`);
 
     // =========================================================================
-    // PASS 1: Generate vector PDF with Polotno (with bleed/crop marks)
+    // STEP 1: Apply bleed to pages
     // =========================================================================
-    // Set bleed on each page if not already set
     const sceneWithBleed = {
       ...scene,
       pages: scene.pages.map(page => ({
@@ -221,15 +379,18 @@ app.post('/export-multipage', authenticate, async (req, res) => {
       })),
     };
 
-    // Polotno PDF export options
-    const polotnoOptions = {
-      title: options.title || 'MergeKit Export',
-      includeBleed: bleedPx > 0,
-      cropMarkSize: cropMarkPx,
-    };
+    // =========================================================================
+    // STEP 2: Inject crop mark elements if requested
+    // =========================================================================
+    const sceneWithMarks = injectCropMarks(sceneWithBleed, bleedPx, wantCropMarks);
 
+    // =========================================================================
+    // PASS 1: Generate vector PDF with Polotno
+    // =========================================================================
     console.log(`[${jobId}] Pass 1: Polotno vector PDF generation...`);
-    await jsonToPDF(sceneWithBleed, vectorPath, polotnoOptions);
+    await jsonToPDF(sceneWithMarks, vectorPath, {
+      title: options.title || 'MergeKit Export',
+    });
 
     const vectorStats = await fs.stat(vectorPath);
     console.log(`[${jobId}] Vector PDF generated: ${vectorStats.size} bytes`);
@@ -283,6 +444,7 @@ app.post('/export-multipage', authenticate, async (req, res) => {
     res.set('X-Render-Time-Ms', String(Date.now() - startTime));
     res.set('X-Page-Count', String(pageCount));
     res.set('X-Color-Mode', wantCmyk ? 'cmyk' : 'rgb');
+    res.set('X-Crop-Marks', wantCropMarks ? 'injected' : 'none');
     res.send(pdfBuffer);
   } catch (e) {
     console.error(`[${jobId}] Multi-page export error:`, e);
@@ -406,4 +568,5 @@ app.post('/batch-render', authenticate, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`PDF Export Service running on port ${PORT}`);
   console.log(`Endpoints: /health, /render-vector, /batch-render-vector, /export-multipage, /export-labels, /compose-pdfs`);
+  console.log(`Crop marks: Vector injection enabled`);
 });
