@@ -173,6 +173,16 @@ function injectCropMarks(scene, bleedPx, enableCropMarks) {
     return scene;
   }
   
+  // Read dimensions from SCENE level (correct Polotno structure)
+  const trimWidth = scene.width;
+  const trimHeight = scene.height;
+  
+  // Validate dimensions to prevent NaN
+  if (!trimWidth || !trimHeight || isNaN(trimWidth) || isNaN(trimHeight)) {
+    console.warn('[crop-marks] Scene dimensions missing, skipping crop marks');
+    return scene;
+  }
+  
   // Crop mark dimensions at 300 DPI
   // Mark length: 10mm ≈ 118px (10 * 300 / 25.4)
   // Mark offset: 3mm ≈ 35px (3 * 300 / 25.4)
@@ -180,11 +190,9 @@ function injectCropMarks(scene, bleedPx, enableCropMarks) {
   const markOffset = Math.round(3 * (300 / 25.4));  // ~35px
   
   const modifiedPages = scene.pages.map((page, pageIndex) => {
-    const trimWidth = page.width;
-    const trimHeight = page.height;
     const bleed = page.bleed || bleedPx;
     
-    // Generate crop marks for all four corners
+    // Generate crop marks for all four corners using scene dimensions
     const cropMarkElements = [
       ...generateCornerCropMarks('tl', trimWidth, trimHeight, bleed, markLength, markOffset),
       ...generateCornerCropMarks('tr', trimWidth, trimHeight, bleed, markLength, markOffset),
@@ -192,7 +200,7 @@ function injectCropMarks(scene, bleedPx, enableCropMarks) {
       ...generateCornerCropMarks('br', trimWidth, trimHeight, bleed, markLength, markOffset),
     ];
     
-    console.log(`[crop-marks] Page ${pageIndex + 1}: Added ${cropMarkElements.length} crop mark elements`);
+    console.log(`[crop-marks] Page ${pageIndex + 1}: Added ${cropMarkElements.length} marks at ${trimWidth}x${trimHeight}px`);
     
     return {
       ...page,
