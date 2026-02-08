@@ -1,35 +1,37 @@
 FROM node:20-slim
 
-# Install OS deps
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ghostscript wget ca-certificates file && \
-    rm -rf /var/lib/apt/lists/*
+# Install Ghostscript (required by @polotno/pdf-export)
+RUN apt-get update && apt-get install -y \
+    ghostscript \
+    fonts-liberation \
+    fonts-dejavu-core \
+    fontconfig \
+    && rm -rf /var/lib/apt/lists/*
 
+# Create app directory
 WORKDIR /app
 
-# Create profiles directory
+# Create profiles directory for ICC profiles
 RUN mkdir -p /app/profiles
 
-# Download ICC profiles (follow redirects) and verify they are not HTML
-RUN wget -L -O /app/profiles/GRACoL2013_CRPC6.icc \
-      "https://www.colormanagement.org/downloads/GRACoL2013_CRPC6.icc" && \
-    wget -L -O /app/profiles/ISOcoated_v2_eci.icc \
-      "https://www.colormanagement.org/downloads/ISOcoated_v2_eci.icc" && \
-    file /app/profiles/*.icc | tee /tmp/icc_filetypes.txt && \
-    ! grep -qi "text/html" /tmp/icc_filetypes.txt
+# Copy ICC profiles (you should have these in your repo)
+COPY profiles/ /app/profiles/
 
 # Copy package files
 COPY package*.json ./
 
-# Install production deps (does NOT require package-lock.json)
-RUN npm install --omit=dev --no-audit --no-fund
+# Install dependencies
+RUN npm ci --only=production
 
 # Copy application code
 COPY server.js ./
 
+# Expose port
 EXPOSE 3000
 
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+  CMD curl -f http://localhost:3000/health || exit 1
 
+# Start the server
 CMD ["node", "server.js"]
