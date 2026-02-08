@@ -1,38 +1,35 @@
 FROM node:20-slim
 
-# Install Ghostscript (required by @polotno/pdf-export) and curl for healthcheck
+# Install system dependencies including Ghostscript and qpdf for PDF handling
 RUN apt-get update && apt-get install -y \
-  ghostscript \
-  fonts-liberation \
-  fonts-dejavu-core \
-  fontconfig \
-  curl \
-  && rm -rf /var/lib/apt/lists/*
+    ghostscript \
+    qpdf \
+    fonts-dejavu-core \
+    fonts-liberation \
+    fontconfig \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
 WORKDIR /app
 
-# Create profiles directory for ICC profiles
-RUN mkdir -p /app/profiles
-
-# Copy ICC profiles (you should have these in your repo)
-COPY profiles/ /app/profiles/
-
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies (use npm install since no lockfile)
-RUN npm install --omit=dev
+# Install dependencies
+RUN npm ci --only=production
 
-# Copy application code
-COPY server.js ./
+# Copy ICC profiles for color management
+COPY icc-profiles/ ./icc-profiles/
+
+# Copy app source
+COPY . .
 
 # Expose port
 EXPOSE 3000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3000/health || exit 1
+    CMD curl -f http://localhost:3000/health || exit 1
 
-# Start the server
 CMD ["node", "server.js"]
