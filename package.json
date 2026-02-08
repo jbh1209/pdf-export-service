@@ -1,13 +1,20 @@
 {
-  "name": "cmyk-conversion-service",
-  "version": "1.0.0",
-  "private": true,
+  "name": "mergekit-pdf-service",
+  "version": "2.0.0",
+  "description": "PDF rendering service with @polotno/pdf-export for vector CMYK output",
+  "type": "module",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "@polotno/pdf-export": "^0.1.36",
+    "express": "^4.21.0",
+    "uuid": "^10.0.0",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
