@@ -1,65 +1,47 @@
-const express = require('express');
-const { execSync } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
+import express from 'express';
+import cors from 'cors';
+import { jsonToPDF } from '@polotno/pdf-export';
+import fs from 'fs/promises';
+import path from 'path';
+import { v4 as uuidv4 } from 'uuid';
+import { execSync } from 'child_process';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const API_SECRET = process.env.API_SECRET;
+const API_SECRET = process.env.API_SECRET || 'V9rQm7L2xAPz8K4nW6bY3cJ5';
 
-// ICC profile paths
-const PROFILES = {
-  gracol: '/app/profiles/GRACoL2013_CRPC6.icc',
-  fogra39: '/app/profiles/ISOcoated_v2_eci.icc'
-};
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
 
-// =============================================================================
-// MIDDLEWARE
-// =============================================================================
-
-// Authentication middleware
-const authMiddleware = (req, res, next) => {
-  if (!API_SECRET) {
-    console.error('[Auth] API_SECRET not configured');
-    return res.status(500).json({ error: 'Server misconfigured' });
-  }
-
-  const providedKey = req.headers['x-api-key'];
-  if (!providedKey || providedKey !== API_SECRET) {
-    console.warn('[Auth] Invalid or missing API key');
+// Auth middleware
+const authenticate = (req, res, next) => {
+  const apiKey = req.headers['x-api-key'];
+  if (apiKey !== API_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-
   next();
 };
-
-// CORS middleware
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
-
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
 
 // =============================================================================
 // HEALTH CHECK
 // =============================================================================
-
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   try {
+    // Check Ghostscript
     const gsVersion = execSync('gs --version', { encoding: 'utf8' }).trim();
-
-    const gracolExists = fs.existsSync(PROFILES.gracol);
-    const fogra39Exists = fs.existsSync(PROFILES.fogra39);
+    
+    // Check ICC profiles
+    const profilesDir = '/app/profiles';
+    const gracolExists = await fs.access(path.join(profilesDir, 'GRACoL2013_CRPC6.icc'))
+      .then(() => true).catch(() => false);
+    const fogra39Exists = await fs.access(path.join(profilesDir, 'ISOcoated_v2_eci.icc'))
+      .then(() => true).catch(() => false);
 
     res.json({
       status: 'healthy',
       ghostscript: gsVersion,
+      polotnoExport: true,
       profiles: {
         gracol: gracolExists,
         fogra39: fogra39Exists
@@ -75,179 +57,296 @@ app.get('/health', (req, res) => {
 });
 
 // =============================================================================
-// CMYK CONVERSION ENDPOINT
+// RENDER VECTOR - Single scene to PDF
+// Uses @polotno/pdf-export for true vector output
 // =============================================================================
+app.post('/render-vector', authenticate, async (req, res) => {
+  const { scene, options = {} } = req.body;
+  
+  if (!scene) {
+    return res.status(400).json({ error: 'Missing scene data' });
+  }
 
-app.post(
-  '/convert-cmyk',
-  authMiddleware,
-  express.raw({ type: 'application/pdf', limit: '100mb' }),
-  async (req, res) => {
-    const startTime = Date.now();
-    const profile = req.query.profile === 'fogra39' ? 'fogra39' : 'gracol';
-    const profilePath = PROFILES[profile];
+  const tempDir = `/tmp/render-${uuidv4()}`;
+  const outputPath = path.join(tempDir, 'output.pdf');
+  const startTime = Date.now();
 
-    console.log(`[Convert] Starting CMYK conversion with profile: ${profile}`);
+  try {
+    await fs.mkdir(tempDir, { recursive: true });
 
-    if (!req.body || req.body.length === 0) {
+    console.log(`[render-vector] Starting render, CMYK: ${options.cmyk ?? false}`);
+
+    // Use @polotno/pdf-export for true vector PDF
+    await jsonToPDF(scene, outputPath, {
+      pdfx1a: options.cmyk ?? false,  // Native CMYK via PDF/X-1a
+      metadata: {
+        title: options.title || 'MergeKit Export',
+        application: 'MergeKit VPS',
+        creator: 'MergeKit PDF Service'
+      }
+    });
+
+    // Read the generated PDF
+    const pdfBuffer = await fs.readFile(outputPath);
+    const renderTime = Date.now() - startTime;
+
+    console.log(`[render-vector] Success: ${pdfBuffer.length} bytes in ${renderTime}ms`);
+
+    // Return PDF
+    res.set('Content-Type', 'application/pdf');
+    res.set('Content-Length', pdfBuffer.length);
+    res.set('X-Render-Time-Ms', renderTime.toString());
+    res.send(pdfBuffer);
+
+    // Cleanup
+    await fs.rm(tempDir, { recursive: true, force: true });
+  } catch (error) {
+    console.error('[render-vector] Error:', error);
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    res.status(500).json({
+      error: 'Render failed',
+      details: error.message
+    });
+  }
+});
+
+// =============================================================================
+// BATCH RENDER VECTOR - Multiple scenes to PDFs
+// Returns array of base64-encoded PDFs
+// =============================================================================
+app.post('/batch-render-vector', authenticate, async (req, res) => {
+  const { scenes, options = {} } = req.body;
+
+  if (!scenes || !Array.isArray(scenes) || scenes.length === 0) {
+    return res.status(400).json({ error: 'Missing or empty scenes array' });
+  }
+
+  console.log(`[batch-render-vector] Processing ${scenes.length} scenes, CMYK: ${options.cmyk ?? false}`);
+  const startTime = Date.now();
+  const results = [];
+
+  for (let i = 0; i < scenes.length; i++) {
+    const tempDir = `/tmp/batch-${uuidv4()}`;
+    const outputPath = path.join(tempDir, 'output.pdf');
+
+    try {
+      await fs.mkdir(tempDir, { recursive: true });
+
+      await jsonToPDF(scenes[i], outputPath, {
+        pdfx1a: options.cmyk ?? false
+      });
+
+      const pdfBuffer = await fs.readFile(outputPath);
+      results.push({
+        index: i,
+        success: true,
+        pdf: pdfBuffer.toString('base64'),
+        size: pdfBuffer.length
+      });
+
+      await fs.rm(tempDir, { recursive: true, force: true });
+      console.log(`[batch-render-vector] Scene ${i + 1}/${scenes.length} complete`);
+    } catch (error) {
+      console.error(`[batch-render-vector] Scene ${i} failed:`, error.message);
+      results.push({
+        index: i,
+        success: false,
+        error: error.message
+      });
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  const totalTime = Date.now() - startTime;
+  const successCount = results.filter(r => r.success).length;
+
+  console.log(`[batch-render-vector] Complete: ${successCount}/${scenes.length} in ${totalTime}ms`);
+
+  res.json({
+    results,
+    successful: successCount,
+    total: scenes.length,
+    totalTimeMs: totalTime
+  });
+});
+
+// =============================================================================
+// LEGACY: CMYK CONVERSION (kept for backward compatibility)
+// Converts existing RGB PDF to CMYK using Ghostscript
+// =============================================================================
+app.post('/convert-cmyk', authenticate, async (req, res) => {
+  const profile = req.query.profile || 'gracol';
+  const profileMap = {
+    gracol: '/app/profiles/GRACoL2013_CRPC6.icc',
+    fogra39: '/app/profiles/ISOcoated_v2_eci.icc'
+  };
+  const profilePath = profileMap[profile] || profileMap.gracol;
+
+  const tempDir = `/tmp/cmyk-${uuidv4()}`;
+  const inputPath = path.join(tempDir, 'input.pdf');
+  const outputPath = path.join(tempDir, 'output.pdf');
+  const startTime = Date.now();
+
+  try {
+    await fs.mkdir(tempDir, { recursive: true });
+
+    // Get raw PDF bytes from request body
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    const pdfBuffer = Buffer.concat(chunks);
+
+    if (pdfBuffer.length === 0) {
       return res.status(400).json({ error: 'No PDF data provided' });
     }
 
-    if (!fs.existsSync(profilePath)) {
-      console.error(`[Convert] ICC profile not found: ${profilePath}`);
-      return res.status(500).json({ error: `ICC profile not found: ${profile}` });
-    }
+    await fs.writeFile(inputPath, pdfBuffer);
 
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmyk-'));
+    console.log(`[convert-cmyk] Converting ${pdfBuffer.length} bytes with profile: ${profile}`);
+
+    // Ghostscript CMYK conversion (more forgiving than strict PDF/X)
+    const gsCommand = [
+      'gs',
+      '-dBATCH',
+      '-dNOPAUSE',
+      '-dQUIET',
+      '-dNOSAFER',
+      '-dPDFSETTINGS=/prepress',
+      '-dCompatibilityLevel=1.4',
+      '-sDEVICE=pdfwrite',
+      '-sColorConversionStrategy=CMYK',
+      '-sProcessColorModel=DeviceCMYK',
+      '-dConvertCMYKImagesToRGB=false',
+      '-dOverrideICC=true',
+      `-sOutputICCProfile=${profilePath}`,
+      `-sOutputFile=${outputPath}`,
+      inputPath
+    ].join(' ');
+
+    execSync(gsCommand, {
+      encoding: 'utf8',
+      maxBuffer: 50 * 1024 * 1024
+    });
+
+    const cmykBuffer = await fs.readFile(outputPath);
+    const conversionTime = Date.now() - startTime;
+
+    console.log(`[convert-cmyk] Success: ${cmykBuffer.length} bytes in ${conversionTime}ms`);
+
+    res.set('Content-Type', 'application/pdf');
+    res.set('Content-Length', cmykBuffer.length);
+    res.set('X-Conversion-Time-Ms', conversionTime.toString());
+    res.send(cmykBuffer);
+
+    await fs.rm(tempDir, { recursive: true, force: true });
+  } catch (error) {
+    console.error('[convert-cmyk] Error:', error);
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    res.status(500).json({
+      error: 'CMYK conversion failed',
+      details: error.message
+    });
+  }
+});
+
+// =============================================================================
+// BATCH CMYK CONVERSION (legacy)
+// =============================================================================
+app.post('/batch-convert-cmyk', authenticate, async (req, res) => {
+  const { pdfs, profile = 'gracol' } = req.body;
+
+  if (!pdfs || !Array.isArray(pdfs) || pdfs.length === 0) {
+    return res.status(400).json({ error: 'Missing or empty pdfs array' });
+  }
+
+  const profileMap = {
+    gracol: '/app/profiles/GRACoL2013_CRPC6.icc',
+    fogra39: '/app/profiles/ISOcoated_v2_eci.icc'
+  };
+  const profilePath = profileMap[profile] || profileMap.gracol;
+
+  console.log(`[batch-convert-cmyk] Processing ${pdfs.length} PDFs with profile: ${profile}`);
+  const startTime = Date.now();
+  const results = [];
+
+  for (let i = 0; i < pdfs.length; i++) {
+    const tempDir = `/tmp/batch-cmyk-${uuidv4()}`;
     const inputPath = path.join(tempDir, 'input.pdf');
     const outputPath = path.join(tempDir, 'output.pdf');
 
     try {
-      fs.writeFileSync(inputPath, req.body);
-      console.log(`[Convert] Input PDF: ${req.body.length} bytes`);
+      await fs.mkdir(tempDir, { recursive: true });
+
+      // Decode base64 PDF
+      const pdfBuffer = Buffer.from(pdfs[i], 'base64');
+      await fs.writeFile(inputPath, pdfBuffer);
 
       const gsCommand = [
         'gs',
         '-dBATCH',
         '-dNOPAUSE',
+        '-dQUIET',
         '-dNOSAFER',
-        '-dPDFX',
+        '-dPDFSETTINGS=/prepress',
+        '-dCompatibilityLevel=1.4',
         '-sDEVICE=pdfwrite',
         '-sColorConversionStrategy=CMYK',
         '-sProcessColorModel=DeviceCMYK',
+        '-dConvertCMYKImagesToRGB=false',
         '-dOverrideICC=true',
         `-sOutputICCProfile=${profilePath}`,
         `-sOutputFile=${outputPath}`,
         inputPath
       ].join(' ');
 
-      console.log('[Convert] Running Ghostscript...');
       execSync(gsCommand, {
         encoding: 'utf8',
         maxBuffer: 50 * 1024 * 1024
       });
 
-      const cmykPdf = fs.readFileSync(outputPath);
-      const duration = Date.now() - startTime;
-
-      console.log(`[Convert] Success: ${cmykPdf.length} bytes in ${duration}ms`);
-
-      res.set('Content-Type', 'application/pdf');
-      res.set('X-Conversion-Time-Ms', duration.toString());
-      res.send(cmykPdf);
-    } catch (error) {
-      console.error('[Convert] Ghostscript error:', error.message);
-      res.status(500).json({
-        error: 'CMYK conversion failed',
-        details: error.message
+      const cmykBuffer = await fs.readFile(outputPath);
+      results.push({
+        index: i,
+        success: true,
+        pdf: cmykBuffer.toString('base64'),
+        size: cmykBuffer.length
       });
-    } finally {
-      try {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      } catch (e) {
-        console.warn('[Convert] Cleanup warning:', e.message);
-      }
+
+      await fs.rm(tempDir, { recursive: true, force: true });
+    } catch (error) {
+      console.error(`[batch-convert-cmyk] PDF ${i} failed:`, error.message);
+      results.push({
+        index: i,
+        success: false,
+        error: error.message
+      });
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
   }
-);
 
-// =============================================================================
-// BATCH CONVERSION ENDPOINT
-// =============================================================================
+  const totalTime = Date.now() - startTime;
+  const successCount = results.filter(r => r.success).length;
 
-app.post(
-  '/batch-convert-cmyk',
-  authMiddleware,
-  express.json({ limit: '200mb' }),
-  async (req, res) => {
-    const startTime = Date.now();
-    const { pdfs, profile = 'gracol' } = req.body;
+  console.log(`[batch-convert-cmyk] Complete: ${successCount}/${pdfs.length} in ${totalTime}ms`);
 
-    if (!Array.isArray(pdfs) || pdfs.length === 0) {
-      return res.status(400).json({ error: 'No PDFs provided' });
-    }
-
-    console.log(`[Batch] Converting ${pdfs.length} PDFs with profile: ${profile}`);
-
-    const profilePath = PROFILES[profile] || PROFILES.gracol;
-    const results = [];
-
-    for (let i = 0; i < pdfs.length; i++) {
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cmyk-batch-'));
-      const inputPath = path.join(tempDir, 'input.pdf');
-      const outputPath = path.join(tempDir, 'output.pdf');
-
-      try {
-        const pdfBuffer = Buffer.from(pdfs[i], 'base64');
-        fs.writeFileSync(inputPath, pdfBuffer);
-
-        const gsCommand = [
-          'gs',
-          '-dBATCH',
-          '-dNOPAUSE',
-          '-dNOSAFER',
-          '-dPDFX',
-          '-sDEVICE=pdfwrite',
-          '-sColorConversionStrategy=CMYK',
-          '-sProcessColorModel=DeviceCMYK',
-          '-dOverrideICC=true',
-          `-sOutputICCProfile=${profilePath}`,
-          `-sOutputFile=${outputPath}`,
-          inputPath
-        ].join(' ');
-
-        execSync(gsCommand, { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 });
-
-        const cmykPdf = fs.readFileSync(outputPath);
-        results.push({
-          success: true,
-          data: cmykPdf.toString('base64')
-        });
-
-        console.log(`[Batch] Converted ${i + 1}/${pdfs.length}`);
-      } catch (error) {
-        console.error(`[Batch] Error on PDF ${i + 1}:`, error.message);
-        results.push({
-          success: false,
-          error: error.message
-        });
-      } finally {
-        try {
-          fs.rmSync(tempDir, { recursive: true, force: true });
-        } catch (e) {}
-      }
-    }
-
-    const duration = Date.now() - startTime;
-    console.log(
-      `[Batch] Complete: ${results.filter((r) => r.success).length}/${pdfs.length} successful in ${duration}ms`
-    );
-
-    res.json({
-      success: true,
-      results,
-      totalTime: duration
-    });
-  }
-);
+  res.json({
+    results,
+    successful: successCount,
+    total: pdfs.length,
+    totalTimeMs: totalTime
+  });
+});
 
 // =============================================================================
 // START SERVER
 // =============================================================================
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`CMYK Conversion Service running on port ${PORT}`);
-  console.log(`API_SECRET configured: ${API_SECRET ? 'Yes' : 'NO (server will return 500 on authed routes)'}`);
-
-  try {
-    const gsVersion = execSync('gs --version', { encoding: 'utf8' }).trim();
-    console.log(`Ghostscript version: ${gsVersion}`);
-  } catch (e) {
-    console.error('WARNING: Ghostscript not found!');
-  }
-
-  Object.entries(PROFILES).forEach(([name, p]) => {
-    const exists = fs.existsSync(p);
-    console.log(`ICC Profile ${name}: ${exists ? 'Found' : 'MISSING!'}`);
-  });
+app.listen(PORT, () => {
+  console.log(`MergeKit PDF Service v2.0.0 running on port ${PORT}`);
+  console.log(`Endpoints:`);
+  console.log(`  GET  /health              - Health check`);
+  console.log(`  POST /render-vector       - Render scene to vector PDF`);
+  console.log(`  POST /batch-render-vector - Batch render scenes`);
+  console.log(`  POST /convert-cmyk        - Convert PDF to CMYK (legacy)`);
+  console.log(`  POST /batch-convert-cmyk  - Batch CMYK conversion (legacy)`);
 });
