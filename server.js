@@ -416,13 +416,7 @@ app.listen(PORT, () => {
   console.log(`PDF Export Service running on port ${PORT}`);
   console.log(`Endpoints: /health, /render-vector, /batch-render-vector, /export-multipage, /export-labels, /compose-pdfs`);
 });
-```
 
-## package.json Dependencies
-
-Make sure your package.json includes:
-
-```json
 {
   "dependencies": {
     "express": "^4.18.2",
