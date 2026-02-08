@@ -51,7 +51,7 @@ app.get('/health', async (req, res) => {
     const { stdout: gsVersion } = await execAsync('gs --version');
     
     // Check ICC profiles
-    const iccPath = path.join(__dirname, 'icc-profiles');
+    const iccPath = path.join(__dirname, 'profiles');
     const gracol = await fs.access(path.join(iccPath, 'GRACoL2013_CRPC6.icc')).then(() => true).catch(() => false);
     const fogra = await fs.access(path.join(iccPath, 'ISOcoated_v2_eci.icc')).then(() => true).catch(() => false);
 
