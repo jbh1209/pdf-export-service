@@ -416,12 +416,3 @@ app.listen(PORT, () => {
   console.log(`PDF Export Service running on port ${PORT}`);
   console.log(`Endpoints: /health, /render-vector, /batch-render-vector, /export-multipage, /export-labels, /compose-pdfs`);
 });
-
-{
-  "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "uuid": "^9.0.0",
-    "@polotno/pdf-export": "^0.5.0"
-  }
-}
