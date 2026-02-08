@@ -20,7 +20,7 @@ COPY package*.json ./
 RUN npm ci --only=production
 
 # Copy ICC profiles for color management
-COPY icc-profiles/ ./icc-profiles/
+COPY profiles/ ./profiles/
 
 # Copy app source
 COPY . .
