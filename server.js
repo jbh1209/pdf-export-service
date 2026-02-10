@@ -53,8 +53,8 @@ function authenticate(req, res, next) {
 // =============================================================================
 async function convertToCmykSafe(inputPath, outputPath, iccProfile) {
   const profilePath = iccProfile === 'fogra39'
-    ? '/app/icc/ISOcoated_v2_eci.icc'
-    : '/app/icc/GRACoL2013_CRPC6.icc';
+    ? '/profiles/ISOcoated_v2_eci.icc'
+    : '/profiles/GRACoL2013_CRPC6.icc';
 
   // Check if ICC profile exists, fall back to default conversion without profile
   let useProfile = true;
@@ -196,8 +196,8 @@ app.get('/health', async (req, res) => {
     // Check ICC profiles
     let iccStatus = {};
     for (const [name, path_] of [
-      ['GRACoL2013', '/app/icc/GRACoL2013_CRPC6.icc'],
-      ['Fogra39', '/app/icc/ISOcoated_v2_eci.icc'],
+      ['GRACoL2013', '/profiles/GRACoL2013_CRPC6.icc'],
+      ['Fogra39', '/profiles/ISOcoated_v2_eci.icc'],
     ]) {
       try {
         await fs.access(path_);
