@@ -12,7 +12,8 @@
     "@polotno/pdf-export": "^0.1.36",
     "express": "^4.21.0",
     "uuid": "^10.0.0",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "pdf-lib": "^1.17.1"
   },
   "engines": {
     "node": ">=18.0.0"
