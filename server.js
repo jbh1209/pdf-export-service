@@ -7,7 +7,7 @@ import { jsonToPDF } from '@polotno/pdf-export';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
-import { PDFDocument, rgb, PDFName, PDFArray, PDFNumber } from 'pdf-lib';
+import { PDFDocument, PDFName, PDFArray, PDFNumber } from 'pdf-lib';
 
 const execAsync = promisify(exec);
 
@@ -45,7 +45,7 @@ function authenticate(req, res, next) {
 }
 
 // =============================================================================
-// GHOSTSCRIPT VECTOR-SAFE CMYK CONVERSION (Pass 2)
+// GHOSTSCRIPT VECTOR-SAFE CMYK CONVERSION
 //
 // Converts RGB PDF to CMYK using specific flags that preserve vectors.
 // CRITICAL: Do NOT use -dPDFSETTINGS=/prepress — it causes transparency
@@ -101,29 +101,28 @@ async function convertToCmykSafe(inputPath, outputPath, iccProfile) {
 }
 
 // =============================================================================
-// CROP MARKS + PDF BOXES — pdf-lib post-processor (Pass 3, additive only)
+// PDF BOXES METADATA ONLY — pdf-lib post-processor (additive only)
+//
+// Sets TrimBox and BleedBox metadata. Crop marks are now drawn natively by
+// Polotno via the cropMarkSize option in jsonToPDF().
 // =============================================================================
-async function addCropMarksAndBoxes(inputPath, bleedMm, outputPath) {
+async function addPdfBoxes(inputPath, bleedMm, outputPath) {
   const pdfBytes = await fs.readFile(inputPath);
   const pdfDoc = await PDFDocument.load(pdfBytes);
 
   const bleedPt = bleedMm * (72 / 25.4); // mm to PDF points
-  const markLength = 14;    // ~5mm in points
-  const markOffset = 8.5;   // ~3mm gap between bleed edge and mark start
-  const strokeWidth = 0.25;
-  const markColor = rgb(0, 0, 0); // Registration black
 
   for (const page of pdfDoc.getPages()) {
     const { width, height } = page.getSize();
 
-    // MediaBox = full page including bleed (what Polotno exported)
+    // MediaBox = full page including bleed + crop mark area (what Polotno exported)
     // TrimBox = inset by bleedPt on all sides (where the cut happens)
     const trimX = bleedPt;
     const trimY = bleedPt;
     const trimW = width - bleedPt * 2;
     const trimH = height - bleedPt * 2;
 
-    // ── Set TrimBox and BleedBox ──
+    // ── Set TrimBox ──
     const trimBox = PDFArray.withContext(pdfDoc.context);
     trimBox.push(PDFNumber.of(trimX));
     trimBox.push(PDFNumber.of(trimY));
@@ -131,47 +130,87 @@ async function addCropMarksAndBoxes(inputPath, bleedMm, outputPath) {
     trimBox.push(PDFNumber.of(trimY + trimH));
     page.node.set(PDFName.of('TrimBox'), trimBox);
 
+    // ── Set BleedBox (same as MediaBox — full page is the bleed area) ──
     const bleedBox = PDFArray.withContext(pdfDoc.context);
     bleedBox.push(PDFNumber.of(0));
     bleedBox.push(PDFNumber.of(0));
     bleedBox.push(PDFNumber.of(width));
     bleedBox.push(PDFNumber.of(height));
     page.node.set(PDFName.of('BleedBox'), bleedBox);
-
-    // ── Draw crop marks — 4 corners × 2 lines each = 8 lines ──
-    const corners = [
-      [trimX, trimY + trimH, -1,  1], // Top-left
-      [trimX + trimW, trimY + trimH,  1,  1], // Top-right
-      [trimX, trimY, -1, -1], // Bottom-left
-      [trimX + trimW, trimY, 1, -1], // Bottom-right
-    ];
-
-    for (const [cx, cy, dx, dy] of corners) {
-      // Horizontal mark
-      const hStartX = cx + dx * markOffset;
-      const hEndX = cx + dx * (markOffset + markLength);
-      page.drawLine({
-        start: { x: hStartX, y: cy },
-        end: { x: hEndX, y: cy },
-        thickness: strokeWidth,
-        color: markColor,
-      });
-
-      // Vertical mark
-      const vStartY = cy + dy * markOffset;
-      const vEndY = cy + dy * (markOffset + markLength);
-      page.drawLine({
-        start: { x: cx, y: vStartY },
-        end: { x: cx, y: vEndY },
-        thickness: strokeWidth,
-        color: markColor,
-      });
-    }
   }
 
   const modifiedBytes = await pdfDoc.save();
   await fs.writeFile(outputPath, modifiedBytes);
-  console.log(`[crop-marks] Added crop marks + TrimBox/BleedBox (bleed: ${bleedMm}mm = ${bleedPt.toFixed(1)}pt)`);
+  console.log(`[pdf-boxes] Set TrimBox/BleedBox metadata (bleed: ${bleedMm}mm = ${bleedPt.toFixed(1)}pt)`);
+}
+
+// =============================================================================
+// LABEL IMPOSITION — pdf-lib embedPage() for vector-safe tiling
+//
+// Takes a multi-page PDF (one label per page) and tiles them onto sheets
+// at positions defined by the layout grid. embedPage() preserves original
+// content streams (vectors stay vectors, images stay images).
+// =============================================================================
+async function imposeLabels(labelsPath, layout, outputPath, jobId) {
+  const pdfBytes = await fs.readFile(labelsPath);
+  const labelDoc = await PDFDocument.load(pdfBytes);
+  const labelPages = labelDoc.getPages();
+
+  if (labelPages.length === 0) {
+    throw new Error('No label pages to impose');
+  }
+
+  // Layout config (all values in mm, convert to points)
+  const mmToPt = 72 / 25.4;
+  const sheetW = (layout.sheetWidthMm || 215.9) * mmToPt;  // Default Letter width
+  const sheetH = (layout.sheetHeightMm || 279.4) * mmToPt;  // Default Letter height
+  const cols = layout.columns || 3;
+  const rows = layout.rows || 10;
+  const marginLeft = (layout.marginLeftMm || 4.78) * mmToPt;
+  const marginTop = (layout.marginTopMm || 12.7) * mmToPt;
+  const labelW = (layout.labelWidthMm || 66.68) * mmToPt;
+  const labelH = (layout.labelHeightMm || 25.4) * mmToPt;
+  const gapX = (layout.spacingXMm || 3.18) * mmToPt;
+  const gapY = (layout.spacingYMm || 0) * mmToPt;
+  const labelsPerSheet = cols * rows;
+
+  console.log(`[${jobId}] Imposing ${labelPages.length} labels onto ${cols}×${rows} sheets (${labelsPerSheet}/sheet)`);
+
+  const outputDoc = await PDFDocument.create();
+  let labelIndex = 0;
+
+  while (labelIndex < labelPages.length) {
+    // Create a new sheet page
+    const sheetPage = outputDoc.addPage([sheetW, sheetH]);
+
+    for (let row = 0; row < rows && labelIndex < labelPages.length; row++) {
+      for (let col = 0; col < cols && labelIndex < labelPages.length; col++) {
+        // Calculate position (PDF coordinates: origin bottom-left, Y goes up)
+        const x = marginLeft + col * (labelW + gapX);
+        const y = sheetH - marginTop - (row + 1) * labelH - row * gapY;
+
+        // Embed the label page from source document
+        const [embeddedPage] = await outputDoc.embedPdf(labelDoc, [labelIndex]);
+
+        // Draw the embedded page at the calculated position, scaled to fit
+        sheetPage.drawPage(embeddedPage, {
+          x,
+          y,
+          width: labelW,
+          height: labelH,
+        });
+
+        labelIndex++;
+      }
+    }
+  }
+
+  const sheetsCreated = Math.ceil(labelPages.length / labelsPerSheet);
+  console.log(`[${jobId}] Imposition complete: ${labelPages.length} labels on ${sheetsCreated} sheets`);
+
+  const outputBytes = await outputDoc.save();
+  await fs.writeFile(outputPath, outputBytes);
+  return Buffer.from(outputBytes);
 }
 
 // =============================================================================
@@ -209,11 +248,12 @@ app.get('/health', async (req, res) => {
 
     res.json({
       status: 'ok',
-      pipeline: 'three-pass (Vector RGB → GS CMYK → pdf-lib crop marks)',
+      pipeline: 'native-crop-marks (Polotno bleed+crops → pdf-lib boxes → GS CMYK)',
       ghostscript: gsAvailable ? `${gsVersion} (used for vector-safe CMYK conversion)` : 'NOT INSTALLED — CMYK will fail',
       qpdf: qpdfVersion,
       iccProfiles: iccStatus,
-      polotno: '@polotno/pdf-export available',
+      polotno: '@polotno/pdf-export with native cropMarkSize support',
+      endpoints: ['/health', '/render-vector', '/batch-render-vector', '/export-multipage', '/export-labels', '/compose-pdfs', '/verify-pdf'],
     });
   } catch (e) {
     res.status(500).json({ status: 'error', error: e.message });
@@ -221,18 +261,141 @@ app.get('/health', async (req, res) => {
 });
 
 // =============================================================================
-// EXPORT MULTI-PAGE PDF — THREE-PASS PIPELINE
+// VERIFY PDF — Diagnostic endpoint using Ghostscript to inspect PDF properties
+// =============================================================================
+app.post('/verify-pdf', authenticate, async (req, res) => {
+  const jobId = uuidv4();
+  const inputPath = path.join(TEMP_DIR, `${jobId}-verify.pdf`);
+
+  try {
+    // Accept either base64 PDF in JSON body or raw PDF bytes
+    let pdfBuffer;
+    const contentType = req.headers['content-type'] || '';
+
+    if (contentType.includes('application/pdf')) {
+      const chunks = [];
+      for await (const chunk of req) { chunks.push(chunk); }
+      pdfBuffer = Buffer.concat(chunks);
+    } else {
+      const { pdf } = req.body;
+      if (!pdf) return res.status(400).json({ error: 'Provide base64 PDF in { pdf: "..." } or raw PDF bytes' });
+      pdfBuffer = Buffer.from(pdf, 'base64');
+    }
+
+    await fs.writeFile(inputPath, pdfBuffer);
+
+    // 1. Use pdf-lib to read page boxes and basic structure
+    const pdfDoc = await PDFDocument.load(pdfBuffer);
+    const pages = pdfDoc.getPages();
+
+    const pageDetails = pages.map((page, i) => {
+      const { width, height } = page.getSize();
+      const trimBox = page.node.lookup(PDFName.of('TrimBox'));
+      const bleedBox = page.node.lookup(PDFName.of('BleedBox'));
+
+      const parseBox = (box) => {
+        if (!box) return null;
+        try {
+          const arr = box;
+          return {
+            x1: arr.lookup(0)?.value() ?? arr.get(0)?.value(),
+            y1: arr.lookup(1)?.value() ?? arr.get(1)?.value(),
+            x2: arr.lookup(2)?.value() ?? arr.get(2)?.value(),
+            y2: arr.lookup(3)?.value() ?? arr.get(3)?.value(),
+          };
+        } catch { return 'present (unable to parse)'; }
+      };
+
+      return {
+        page: i + 1,
+        mediaBox: { width: Math.round(width * 100) / 100, height: Math.round(height * 100) / 100 },
+        mediaBoxMm: {
+          width: Math.round(width / 72 * 25.4 * 10) / 10,
+          height: Math.round(height / 72 * 25.4 * 10) / 10,
+        },
+        trimBox: parseBox(trimBox),
+        bleedBox: parseBox(bleedBox),
+      };
+    });
+
+    // 2. Use Ghostscript to detect color spaces
+    let colorSpaces = [];
+    try {
+      // Ghostscript's pdfinfo device reports color usage
+      const gsInfoCmd = `gs -dBATCH -dNOPAUSE -dQUIET -sDEVICE=inkcov -o - "${inputPath}" 2>&1`;
+      const { stdout } = await execAsync(gsInfoCmd, { timeout: 30000 });
+
+      // inkcov outputs lines like: 0.10000  0.20000  0.30000  0.40000 CMYK OK
+      const lines = stdout.trim().split('\n').filter(l => l.includes('CMYK OK') || l.includes('OK'));
+      let hasCmyk = false;
+      let hasRgb = false;
+
+      for (const line of lines) {
+        const match = line.match(/([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/);
+        if (match) {
+          const [_, c, m, y, k] = match.map(Number);
+          // If any CMY channels have coverage, it's using CMYK
+          if (c > 0 || m > 0 || y > 0 || k > 0) {
+            hasCmyk = true;
+          }
+        }
+      }
+
+      colorSpaces = hasCmyk ? ['DeviceCMYK'] : ['DeviceRGB'];
+    } catch (e) {
+      colorSpaces = [`detection failed: ${e.message}`];
+    }
+
+    // 3. Check for vector vs raster content using Ghostscript text extraction
+    let contentAnalysis = {};
+    try {
+      // Try to extract text — if text is extractable, it's vector (not rasterized)
+      const txtPath = path.join(TEMP_DIR, `${jobId}-text.txt`);
+      await execAsync(`gs -dBATCH -dNOPAUSE -dQUIET -sDEVICE=txtwrite -sOutputFile="${txtPath}" "${inputPath}"`, { timeout: 30000 });
+      const text = await fs.readFile(txtPath, 'utf-8');
+      await fs.unlink(txtPath).catch(() => {});
+
+      const hasText = text.trim().length > 0;
+      contentAnalysis = {
+        extractableText: hasText,
+        textSample: hasText ? text.trim().slice(0, 200) : '(no extractable text — may be outlined/rasterized)',
+        note: hasText
+          ? 'Text is vector (selectable/extractable). Good for editing, outlined for print.'
+          : 'Text is either outlined (vector outlines) or rasterized. Check visually in Acrobat.',
+      };
+    } catch (e) {
+      contentAnalysis = { error: e.message };
+    }
+
+    res.json({
+      fileSize: pdfBuffer.length,
+      pageCount: pages.length,
+      pages: pageDetails,
+      colorSpaces,
+      contentAnalysis,
+      verifiedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error(`[${jobId}] Verify error:`, e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    fs.unlink(inputPath).catch(() => {});
+  }
+});
+
+// =============================================================================
+// EXPORT MULTI-PAGE PDF — NATIVE CROP MARKS PIPELINE
 //
-// Pass 1: Polotno renders VECTOR RGB PDF (pdfx1a: false — preserves vectors)
-// Pass 2: Ghostscript converts RGB→CMYK with vector-safe flags (if requested)
-// Pass 3: pdf-lib adds crop marks + TrimBox/BleedBox (additive only)
+// Pass 1: Polotno renders VECTOR RGB PDF with native crop marks (cropMarkSize)
+// Pass 1b: pdf-lib sets TrimBox/BleedBox metadata only
+// Pass 2: Ghostscript converts EVERYTHING to CMYK (if requested)
 // =============================================================================
 app.post('/export-multipage', authenticate, async (req, res) => {
   const startTime = Date.now();
   const jobId = uuidv4();
   const vectorPath = path.join(TEMP_DIR, `${jobId}-vector.pdf`);
+  const boxedPath = path.join(TEMP_DIR, `${jobId}-boxed.pdf`);
   const cmykPath = path.join(TEMP_DIR, `${jobId}-cmyk.pdf`);
-  const markedPath = path.join(TEMP_DIR, `${jobId}-marked.pdf`);
 
   try {
     const { scene, options = {} } = req.body;
@@ -259,31 +422,31 @@ app.post('/export-multipage', authenticate, async (req, res) => {
       }
     }
 
-    // ── PASS 1: Polotno VECTOR RGB PDF (NO pdfx1a — preserves vectors) ──
-    console.log(`[${jobId}] Pass 1: Polotno vector RGB PDF (includeBleed: ${bleedPx > 0})`);
+    // ── PASS 1: Polotno VECTOR RGB PDF with native crop marks ──
+    console.log(`[${jobId}] Pass 1: Polotno vector RGB PDF (includeBleed: ${bleedPx > 0}, cropMarkSize: ${wantCropMarks ? 20 : 0})`);
     await jsonToPDF(scene, vectorPath, {
       title: options.title || 'MergeKit Export',
       includeBleed: bleedPx > 0,
-      // pdfx1a is intentionally NOT set — keeps true vectors
+      cropMarkSize: wantCropMarks ? 20 : 0,
     });
 
     const vectorSize = (await fs.stat(vectorPath)).size;
-    console.log(`[${jobId}] Pass 1 complete: ${vectorSize} bytes (vector RGB)`);
+    console.log(`[${jobId}] Pass 1 complete: ${vectorSize} bytes (vector RGB${wantCropMarks ? ' + crop marks' : ''})`);
 
-    // ── PASS 2: Ghostscript CMYK conversion (if requested) — vector-safe ──
+    // ── PASS 1b: Set TrimBox/BleedBox metadata (if bleed is used) ──
     let currentPath = vectorPath;
-    if (wantCmyk) {
-      console.log(`[${jobId}] Pass 2: Ghostscript vector-safe CMYK conversion (profile: ${iccProfile})`);
-      await convertToCmykSafe(vectorPath, cmykPath, iccProfile);
-      currentPath = cmykPath;
+    if (bleedMm > 0) {
+      console.log(`[${jobId}] Pass 1b: Setting TrimBox/BleedBox metadata (bleed: ${bleedMm}mm)`);
+      await addPdfBoxes(currentPath, bleedMm, boxedPath);
+      currentPath = boxedPath;
     }
 
-    // ── PASS 3: pdf-lib crop marks + TrimBox/BleedBox (if requested) ──
+    // ── PASS 2: Ghostscript CMYK conversion (if requested) ──
     let finalPath = currentPath;
-    if (wantCropMarks && bleedMm > 0) {
-      console.log(`[${jobId}] Pass 3: Adding crop marks + PDF boxes (bleed: ${bleedMm}mm)`);
-      await addCropMarksAndBoxes(currentPath, bleedMm, markedPath);
-      finalPath = markedPath;
+    if (wantCmyk) {
+      console.log(`[${jobId}] Pass 2: Ghostscript vector-safe CMYK conversion (profile: ${iccProfile})`);
+      await convertToCmykSafe(currentPath, cmykPath, iccProfile);
+      finalPath = cmykPath;
     }
 
     const finalBuffer = await fs.readFile(finalPath);
@@ -294,28 +457,28 @@ app.post('/export-multipage', authenticate, async (req, res) => {
     res.set('X-Render-Time-Ms', String(Date.now() - startTime));
     res.set('X-Page-Count', String(scene.pages.length));
     res.set('X-Color-Mode', wantCmyk ? 'cmyk' : 'rgb');
-    res.set('X-Crop-Marks', finalPath === markedPath ? 'true' : 'false');
-    res.set('X-Pipeline', 'three-pass');
+    res.set('X-Crop-Marks', String(wantCropMarks));
+    res.set('X-Pipeline', 'native-crop-marks');
     res.send(finalBuffer);
   } catch (e) {
     console.error(`[${jobId}] Multi-page export error:`, e);
     res.status(500).json({ error: e.message, details: e.stack?.slice(0, 500) });
   } finally {
     fs.unlink(vectorPath).catch(() => {});
+    fs.unlink(boxedPath).catch(() => {});
     fs.unlink(cmykPath).catch(() => {});
-    fs.unlink(markedPath).catch(() => {});
   }
 });
 
 // =============================================================================
-// RENDER SINGLE VECTOR PDF — THREE-PASS
+// RENDER SINGLE VECTOR PDF — NATIVE CROP MARKS PIPELINE
 // =============================================================================
 app.post('/render-vector', authenticate, async (req, res) => {
   const startTime = Date.now();
   const jobId = uuidv4();
   const vectorPath = path.join(TEMP_DIR, `${jobId}-vector.pdf`);
+  const boxedPath = path.join(TEMP_DIR, `${jobId}-boxed.pdf`);
   const cmykPath = path.join(TEMP_DIR, `${jobId}-cmyk.pdf`);
-  const markedPath = path.join(TEMP_DIR, `${jobId}-marked.pdf`);
 
   try {
     const { scene, options = {} } = req.body;
@@ -339,24 +502,25 @@ app.post('/render-vector', authenticate, async (req, res) => {
       }
     }
 
-    // Pass 1: Polotno vector RGB (NO pdfx1a)
+    // Pass 1: Polotno vector RGB with native crop marks
     await jsonToPDF(scene, vectorPath, {
       title: options.title || 'Export',
       includeBleed: bleedPx > 0,
+      cropMarkSize: wantCropMarks ? 20 : 0,
     });
 
-    // Pass 2: Optional CMYK conversion
+    // Pass 1b: Set TrimBox/BleedBox metadata
     let currentPath = vectorPath;
-    if (wantCmyk) {
-      await convertToCmykSafe(vectorPath, cmykPath, iccProfile);
-      currentPath = cmykPath;
+    if (bleedMm > 0) {
+      await addPdfBoxes(currentPath, bleedMm, boxedPath);
+      currentPath = boxedPath;
     }
 
-    // Pass 3: Optional crop marks
+    // Pass 2: Optional CMYK conversion
     let finalPath = currentPath;
-    if (wantCropMarks && bleedMm > 0) {
-      await addCropMarksAndBoxes(currentPath, bleedMm, markedPath);
-      finalPath = markedPath;
+    if (wantCmyk) {
+      await convertToCmykSafe(currentPath, cmykPath, iccProfile);
+      finalPath = cmykPath;
     }
 
     const pdfBuffer = await fs.readFile(finalPath);
@@ -366,20 +530,20 @@ app.post('/render-vector', authenticate, async (req, res) => {
     res.set('Content-Type', 'application/pdf');
     res.set('X-Render-Time-Ms', String(Date.now() - startTime));
     res.set('X-Color-Mode', wantCmyk ? 'cmyk' : 'rgb');
-    res.set('X-Pipeline', 'three-pass');
+    res.set('X-Pipeline', 'native-crop-marks');
     res.send(pdfBuffer);
   } catch (e) {
     console.error(`[${jobId}] Error:`, e);
     res.status(500).json({ error: e.message });
   } finally {
     fs.unlink(vectorPath).catch(() => {});
+    fs.unlink(boxedPath).catch(() => {});
     fs.unlink(cmykPath).catch(() => {});
-    fs.unlink(markedPath).catch(() => {});
   }
 });
 
 // =============================================================================
-// BATCH RENDER VECTOR PDFs (returns base64) — THREE-PASS
+// BATCH RENDER VECTOR PDFs (returns base64) — NATIVE CROP MARKS PIPELINE
 // =============================================================================
 app.post('/batch-render-vector', authenticate, async (req, res) => {
   const startTime = Date.now();
@@ -390,9 +554,11 @@ app.post('/batch-render-vector', authenticate, async (req, res) => {
   }
 
   const wantCmyk = options.cmyk === true;
+  const bleedMm = Number.isFinite(options.bleed) ? options.bleed : 0;
+  const wantCropMarks = options.cropMarks === true;
   const iccProfile = options.iccProfile || 'gracol';
 
-  console.log(`[batch] Rendering ${scenes.length} scenes (CMYK: ${wantCmyk})`);
+  console.log(`[batch] Rendering ${scenes.length} scenes (CMYK: ${wantCmyk}, CropMarks: ${wantCropMarks})`);
 
   const results = [];
   let successful = 0;
@@ -400,19 +566,37 @@ app.post('/batch-render-vector', authenticate, async (req, res) => {
   for (let i = 0; i < scenes.length; i++) {
     const jobId = uuidv4();
     const vectorPath = path.join(TEMP_DIR, `${jobId}-vector.pdf`);
+    const boxedPath = path.join(TEMP_DIR, `${jobId}-boxed.pdf`);
     const cmykPath = path.join(TEMP_DIR, `${jobId}-cmyk.pdf`);
 
     try {
-      // Pass 1: Vector RGB
+      const dpi = scenes[i].dpi || 300;
+      const bleedPx = Math.round(bleedMm * (dpi / 25.4));
+
+      if (bleedPx > 0 && scenes[i].pages) {
+        for (const page of scenes[i].pages) {
+          page.bleed = bleedPx;
+        }
+      }
+
+      // Pass 1: Vector RGB with native crop marks
       await jsonToPDF(scenes[i], vectorPath, {
         title: options.title || 'Export',
-        // No pdfx1a — vector RGB
+        includeBleed: bleedPx > 0,
+        cropMarkSize: wantCropMarks ? 20 : 0,
       });
 
+      // Pass 1b: Set TrimBox/BleedBox metadata
+      let currentPath = vectorPath;
+      if (bleedMm > 0) {
+        await addPdfBoxes(currentPath, bleedMm, boxedPath);
+        currentPath = boxedPath;
+      }
+
       // Pass 2: Optional CMYK
-      let finalPath = vectorPath;
+      let finalPath = currentPath;
       if (wantCmyk) {
-        await convertToCmykSafe(vectorPath, cmykPath, iccProfile);
+        await convertToCmykSafe(currentPath, cmykPath, iccProfile);
         finalPath = cmykPath;
       }
 
@@ -426,6 +610,7 @@ app.post('/batch-render-vector', authenticate, async (req, res) => {
       results.push({ index: i, success: false, error: e.message });
     } finally {
       fs.unlink(vectorPath).catch(() => {});
+      fs.unlink(boxedPath).catch(() => {});
       fs.unlink(cmykPath).catch(() => {});
     }
   }
@@ -436,15 +621,15 @@ app.post('/batch-render-vector', authenticate, async (req, res) => {
 });
 
 // =============================================================================
-// EXPORT LABELS WITH IMPOSITION — THREE-PASS
+// EXPORT LABELS WITH IMPOSITION — NATIVE CROP MARKS + TILING
 // =============================================================================
 app.post('/export-labels', authenticate, async (req, res) => {
   const startTime = Date.now();
   const jobId = uuidv4();
   const vectorPath = path.join(TEMP_DIR, `${jobId}-vector.pdf`);
+  const boxedPath = path.join(TEMP_DIR, `${jobId}-boxed.pdf`);
   const cmykPath = path.join(TEMP_DIR, `${jobId}-cmyk.pdf`);
-  const markedPath = path.join(TEMP_DIR, `${jobId}-marked.pdf`);
-  const outputPath = path.join(TEMP_DIR, `${jobId}-imposed.pdf`);
+  const imposedPath = path.join(TEMP_DIR, `${jobId}-imposed.pdf`);
 
   try {
     const { scene, layout, options = {} } = req.body;
@@ -474,57 +659,52 @@ app.post('/export-labels', authenticate, async (req, res) => {
       }
     }
 
-    // Pass 1: Vector RGB
+    // Pass 1: Vector RGB with native crop marks (for individual labels)
     await jsonToPDF(scene, vectorPath, {
       title: options.title || 'Labels Export',
       includeBleed: bleedPx > 0,
-      // No pdfx1a — vector RGB
+      cropMarkSize: wantCropMarks ? 20 : 0,
     });
 
-    // Pass 2: Optional CMYK
+    // Pass 1b: Set TrimBox/BleedBox on individual labels
     let currentPath = vectorPath;
+    if (bleedMm > 0) {
+      await addPdfBoxes(currentPath, bleedMm, boxedPath);
+      currentPath = boxedPath;
+    }
+
+    // Step 2: Impose labels onto sheets
+    console.log(`[${jobId}] Imposing labels onto sheets`);
+    await imposeLabels(currentPath, layout, imposedPath, jobId);
+    currentPath = imposedPath;
+
+    // Step 3: Optional CMYK conversion
+    let finalPath = currentPath;
     if (wantCmyk) {
-      await convertToCmykSafe(vectorPath, cmykPath, iccProfile);
-      currentPath = cmykPath;
+      await convertToCmykSafe(currentPath, cmykPath, iccProfile);
+      finalPath = cmykPath;
     }
 
-    // Pass 3: Optional crop marks
-    if (wantCropMarks && bleedMm > 0) {
-      await addCropMarksAndBoxes(currentPath, bleedMm, markedPath);
-      currentPath = markedPath;
-    }
+    const finalBuffer = await fs.readFile(finalPath);
 
-    // Step 4: Impose labels onto sheets using qpdf
-    const imposedBuffer = await imposeLabelsWithQpdf(currentPath, layout, outputPath, jobId);
-
-    console.log(`[${jobId}] Labels exported + imposed: ${imposedBuffer.length} bytes in ${Date.now() - startTime}ms`);
+    console.log(`[${jobId}] Labels exported + imposed: ${finalBuffer.length} bytes in ${Date.now() - startTime}ms`);
 
     res.set('Content-Type', 'application/pdf');
     res.set('X-Render-Time-Ms', String(Date.now() - startTime));
     res.set('X-Label-Count', String(labelCount));
     res.set('X-Color-Mode', wantCmyk ? 'cmyk' : 'rgb');
-    res.set('X-Pipeline', 'three-pass');
-    res.send(imposedBuffer);
+    res.set('X-Pipeline', 'native-crop-marks');
+    res.send(finalBuffer);
   } catch (e) {
     console.error(`[${jobId}] Label export error:`, e);
     res.status(500).json({ error: e.message });
   } finally {
     fs.unlink(vectorPath).catch(() => {});
+    fs.unlink(boxedPath).catch(() => {});
     fs.unlink(cmykPath).catch(() => {});
-    fs.unlink(markedPath).catch(() => {});
-    fs.unlink(outputPath).catch(() => {});
+    fs.unlink(imposedPath).catch(() => {});
   }
 });
-
-// =============================================================================
-// IMPOSITION HELPER
-// =============================================================================
-async function imposeLabelsWithQpdf(labelsPath, layout, outputPath, jobId) {
-  // For now, return the labels PDF directly (full imposition TBD)
-  const outputBuffer = await fs.readFile(labelsPath);
-  await fs.writeFile(outputPath, outputBuffer);
-  return outputBuffer;
-}
 
 // =============================================================================
 // COMPOSE PDFs (merge multiple PDFs preserving vectors)
@@ -591,6 +771,6 @@ app.post('/batch-render', authenticate, async (req, res) => {
 // =============================================================================
 app.listen(PORT, () => {
   console.log(`PDF Export Service running on port ${PORT}`);
-  console.log(`Pipeline: Three-pass (Vector RGB → GS CMYK → pdf-lib crop marks)`);
-  console.log(`Endpoints: /health, /render-vector, /batch-render-vector, /export-multipage, /export-labels, /compose-pdfs`);
+  console.log(`Pipeline: Native crop marks (Polotno bleed+crops → pdf-lib boxes → GS CMYK)`);
+  console.log(`Endpoints: /health, /render-vector, /batch-render-vector, /export-multipage, /export-labels, /compose-pdfs, /verify-pdf`);
 });
