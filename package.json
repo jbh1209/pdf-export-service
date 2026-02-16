@@ -9,7 +9,7 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "@polotno/pdf-export": "^2.15.7",
+    "@polotno/pdf-export": "^0.1.36",
     "express": "^4.21.0",
     "uuid": "^10.0.0",
     "cors": "^2.8.5",
