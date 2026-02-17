@@ -101,80 +101,114 @@ async function convertToCmykSafe(inputPath, outputPath, iccProfile) {
 }
 
 // =============================================================================
-// PDF-LIB CROP MARKS + BOXES — additive post-processor
+// PDF-LIB CROP MARKS + BOXES — Adobe Illustrator-style extended canvas
 //
-// Draws 8 crop mark lines (4 corners × 2 lines) in RGB black and sets
-// TrimBox/BleedBox metadata. This is the proven approach since
-// @polotno/pdf-export v0.1.36 does NOT support cropMarkSize.
+// Enlarges each page by 10mm on all sides beyond the trim to create dedicated
+// space for crop marks (matching professional prepress tools like Illustrator).
 //
-// Marks are drawn in RGB; the subsequent Ghostscript CMYK pass converts
-// them to registration black automatically.
+// Geometry (e.g. A4 Landscape, 3mm bleed):
+//   Trim:     297 × 210mm
+//   Bleed:    303 × 216mm  (trim + 3mm each side)
+//   Canvas:   317 × 230mm  (trim + 10mm each side)
+//
+// Crop marks: 8mm long, starting 2mm from trim edge
+// Marks drawn in RGB; Ghostscript CMYK pass converts to registration black.
 // =============================================================================
 async function addCropMarksAndBoxes(inputPath, bleedMm, outputPath) {
-  const pdfBytes = await fs.readFile(inputPath);
-  const pdfDoc = await PDFDocument.load(pdfBytes);
+  const srcBytes = await fs.readFile(inputPath);
+  const srcDoc = await PDFDocument.load(srcBytes);
+  const outDoc = await PDFDocument.create();
 
-  const bleedPt = bleedMm * (72 / 25.4); // mm to PDF points
-  const markLength = 10; // 10pt ≈ 3.5mm (standard crop mark length)
-  const markOffset = 3;  // 3pt gap between trim edge and mark start
-  const markThickness = 0.5; // hairline
+  const mmToPt = 72 / 25.4;
+  const bleedPt = bleedMm * mmToPt;
+  const marksExtensionPt = 10 * mmToPt;       // 10mm total from trim edge
+  const extraMarginPt = marksExtensionPt - bleedPt; // extra space beyond bleed
+  const markLength = 8 * mmToPt;               // 8mm crop mark lines
+  const markOffset = 2 * mmToPt;               // 2mm gap from trim edge
+  const markThickness = 0.5;                   // hairline
 
-  for (const page of pdfDoc.getPages()) {
-    const { width, height } = page.getSize();
+  const srcPages = srcDoc.getPages();
 
-    // MediaBox = full page including bleed (what Polotno exported)
-    // TrimBox = inset by bleedPt on all sides (where the cut happens)
-    const trimX = bleedPt;
-    const trimY = bleedPt;
-    const trimW = width - bleedPt * 2;
-    const trimH = height - bleedPt * 2;
+  for (let i = 0; i < srcPages.length; i++) {
+    const srcPage = srcPages[i];
+    const { width: srcW, height: srcH } = srcPage.getSize();
+
+    // Source page = trim + bleed (what Polotno exported)
+    const trimW = srcW - bleedPt * 2;
+    const trimH = srcH - bleedPt * 2;
+
+    // New enlarged canvas = trim + 10mm on each side
+    const fullW = trimW + marksExtensionPt * 2;
+    const fullH = trimH + marksExtensionPt * 2;
+
+    // Create new page at enlarged size
+    const newPage = outDoc.addPage([fullW, fullH]);
+
+    // Embed original page onto the new canvas
+    // The original content is offset so trim aligns at marksExtensionPt inset
+    const [embedded] = await outDoc.embedPdf(srcDoc, [i]);
+    newPage.drawPage(embedded, {
+      x: extraMarginPt,  // offset = 10mm - bleed (positions bleed edge correctly)
+      y: extraMarginPt,
+      width: srcW,
+      height: srcH,
+    });
+
+    // ── Trim coordinates on the new enlarged canvas ──
+    const trimX = marksExtensionPt;                    // left edge of trim
+    const trimY = marksExtensionPt;                    // bottom edge of trim (PDF coords)
+    const trimRight = marksExtensionPt + trimW;        // right edge of trim
+    const trimTop = marksExtensionPt + trimH;          // top edge of trim
 
     // ── Draw crop marks (8 lines: 2 per corner) ──
     const black = rgb(0, 0, 0);
-    const corners = [
-      // Top-left
-      { start: { x: trimX - markOffset - markLength, y: height - trimY }, end: { x: trimX - markOffset, y: height - trimY } },
-      { start: { x: trimX, y: height - trimY + markOffset }, end: { x: trimX, y: height - trimY + markOffset + markLength } },
-      // Top-right
-      { start: { x: trimX + trimW + markOffset, y: height - trimY }, end: { x: trimX + trimW + markOffset + markLength, y: height - trimY } },
-      { start: { x: trimX + trimW, y: height - trimY + markOffset }, end: { x: trimX + trimW, y: height - trimY + markOffset + markLength } },
-      // Bottom-left
+
+    const marks = [
+      // Top-left corner
+      { start: { x: trimX - markOffset - markLength, y: trimTop }, end: { x: trimX - markOffset, y: trimTop } },   // horizontal
+      { start: { x: trimX, y: trimTop + markOffset }, end: { x: trimX, y: trimTop + markOffset + markLength } },     // vertical
+      // Top-right corner
+      { start: { x: trimRight + markOffset, y: trimTop }, end: { x: trimRight + markOffset + markLength, y: trimTop } },
+      { start: { x: trimRight, y: trimTop + markOffset }, end: { x: trimRight, y: trimTop + markOffset + markLength } },
+      // Bottom-left corner
       { start: { x: trimX - markOffset - markLength, y: trimY }, end: { x: trimX - markOffset, y: trimY } },
       { start: { x: trimX, y: trimY - markOffset - markLength }, end: { x: trimX, y: trimY - markOffset } },
-      // Bottom-right
-      { start: { x: trimX + trimW + markOffset, y: trimY }, end: { x: trimX + trimW + markOffset + markLength, y: trimY } },
-      { start: { x: trimX + trimW, y: trimY - markOffset - markLength }, end: { x: trimX + trimW, y: trimY - markOffset } },
+      // Bottom-right corner
+      { start: { x: trimRight + markOffset, y: trimY }, end: { x: trimRight + markOffset + markLength, y: trimY } },
+      { start: { x: trimRight, y: trimY - markOffset - markLength }, end: { x: trimRight, y: trimY - markOffset } },
     ];
 
-    for (const mark of corners) {
-      page.drawLine({
-        start: mark.start,
-        end: mark.end,
-        color: black,
-        thickness: markThickness,
-      });
+    for (const mark of marks) {
+      newPage.drawLine({ start: mark.start, end: mark.end, color: black, thickness: markThickness });
     }
 
-    // ── Set TrimBox ──
-    const trimBox = PDFArray.withContext(pdfDoc.context);
+    // ── Set TrimBox (the finished cut size) ──
+    const trimBox = PDFArray.withContext(outDoc.context);
     trimBox.push(PDFNumber.of(trimX));
     trimBox.push(PDFNumber.of(trimY));
-    trimBox.push(PDFNumber.of(trimX + trimW));
-    trimBox.push(PDFNumber.of(trimY + trimH));
-    page.node.set(PDFName.of('TrimBox'), trimBox);
+    trimBox.push(PDFNumber.of(trimRight));
+    trimBox.push(PDFNumber.of(trimTop));
+    newPage.node.set(PDFName.of('TrimBox'), trimBox);
 
-    // ── Set BleedBox (same as MediaBox — full page is the bleed area) ──
-    const bleedBox = PDFArray.withContext(pdfDoc.context);
-    bleedBox.push(PDFNumber.of(0));
-    bleedBox.push(PDFNumber.of(0));
-    bleedBox.push(PDFNumber.of(width));
-    bleedBox.push(PDFNumber.of(height));
-    page.node.set(PDFName.of('BleedBox'), bleedBox);
+    // ── Set BleedBox (trim + bleed area) ──
+    const bleedBox = PDFArray.withContext(outDoc.context);
+    bleedBox.push(PDFNumber.of(extraMarginPt));          // inset from canvas edge by (10mm - bleed)
+    bleedBox.push(PDFNumber.of(extraMarginPt));
+    bleedBox.push(PDFNumber.of(fullW - extraMarginPt));
+    bleedBox.push(PDFNumber.of(fullH - extraMarginPt));
+    newPage.node.set(PDFName.of('BleedBox'), bleedBox);
+
+    // MediaBox is automatically [0, 0, fullW, fullH] — the entire enlarged canvas
   }
 
-  const modifiedBytes = await pdfDoc.save();
-  await fs.writeFile(outputPath, modifiedBytes);
-  console.log(`[crop-marks] Drew crop marks + set TrimBox/BleedBox (bleed: ${bleedMm}mm = ${bleedPt.toFixed(1)}pt)`);
+  const outBytes = await outDoc.save();
+  await fs.writeFile(outputPath, outBytes);
+
+  const trimWmm = ((srcPages[0]?.getSize().width || 0) - bleedPt * 2) / mmToPt;
+  const trimHmm = ((srcPages[0]?.getSize().height || 0) - bleedPt * 2) / mmToPt;
+  const fullWmm = trimWmm + 20;
+  const fullHmm = trimHmm + 20;
+  console.log(`[crop-marks] Extended canvas: ${trimWmm.toFixed(0)}×${trimHmm.toFixed(0)}mm trim → ${fullWmm.toFixed(0)}×${fullHmm.toFixed(0)}mm canvas (10mm margins, 8mm marks, 2mm offset)`);
 }
 
 // =============================================================================
