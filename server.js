@@ -1,6 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import os from 'os';
 import path from 'path';
 import { promises as fs } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
@@ -18,127 +17,6 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || 'V9rQm7L2xAPz8K4nW6bY3cJ5';
-// -----------------------------------------------------------------------------
-// Simple capacity management + status dashboard
-// -----------------------------------------------------------------------------
-// Docker/Coolify won't automatically protect you from overload. These settings
-// provide backpressure (queue + concurrency limits) and basic runtime telemetry.
-//
-// Tune via env vars:
-//  - MAX_CONCURRENT_JOBS (default: 1)      number of concurrent heavy jobs
-//  - MAX_JOB_QUEUE       (default: 20)     max queued requests before 503
-//  - JOB_TIMEOUT_MS      (default: 180000) soft timeout for job wrapper
-//  - MAX_RSS_MB          (default: 0)      if >0, exit when RSS exceeds threshold (lets platform restart)
-//  - ADMIN_SECRET        (default: API_SECRET) key for /admin and /admin/status
-// -----------------------------------------------------------------------------
-const MAX_CONCURRENT_JOBS = Number.parseInt(process.env.MAX_CONCURRENT_JOBS || '1', 10);
-const MAX_JOB_QUEUE = Number.parseInt(process.env.MAX_JOB_QUEUE || '20', 10);
-const JOB_TIMEOUT_MS = Number.parseInt(process.env.JOB_TIMEOUT_MS || '180000', 10);
-const MAX_RSS_MB = Number.parseInt(process.env.MAX_RSS_MB || '0', 10);
-const ADMIN_SECRET = process.env.ADMIN_SECRET || API_SECRET;
-
-class OverloadedError extends Error {
-  constructor(message = 'Server is busy') {
-    super(message);
-    this.name = 'OverloadedError';
-    this.statusCode = 503;
-  }
-}
-
-const jobState = {
-  active: 0,
-  queued: 0,
-  queue: [],
-  recent: [], // { id, name, ms, ok, at, error? }
-};
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function recordRecent(entry) {
-  jobState.recent.unshift(entry);
-  if (jobState.recent.length > 50) jobState.recent.length = 50;
-}
-
-function withTimeout(promise, ms) {
-  if (!ms || ms <= 0) return promise;
-  let t;
-  const timeout = new Promise((_, reject) => {
-    t = setTimeout(() => reject(new Error(`Job timed out after ${ms}ms`)), ms);
-  });
-  return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
-}
-
-async function runWithCapacity(name, fn) {
-  const startedAt = Date.now();
-  const id = uuidv4();
-
-  // Backpressure: queue if we're at capacity, reject if queue too long.
-  if (jobState.active >= MAX_CONCURRENT_JOBS) {
-    if (jobState.queue.length >= MAX_JOB_QUEUE) {
-      recordRecent({ id, name, ms: 0, ok: false, at: nowIso(), error: 'Overloaded (queue full)' });
-      throw new OverloadedError('All workers are busy. Please retry shortly.');
-    }
-    jobState.queued++;
-    await new Promise((resolve) => jobState.queue.push(resolve));
-    jobState.queued--;
-  }
-
-  jobState.active++;
-  try {
-    await withTimeout(Promise.resolve().then(fn), JOB_TIMEOUT_MS);
-    recordRecent({ id, name, ms: Date.now() - startedAt, ok: true, at: nowIso() });
-  } catch (e) {
-    recordRecent({ id, name, ms: Date.now() - startedAt, ok: false, at: nowIso(), error: e?.message || String(e) });
-    throw e;
-  } finally {
-    jobState.active--;
-    const next = jobState.queue.shift();
-    if (next) next();
-  }
-}
-
-const withCapacity = (name, handler) => async (req, res) => {
-  try {
-    await runWithCapacity(name, () => handler(req, res));
-  } catch (e) {
-    if (e?.name === 'OverloadedError') {
-      return res.status(503).json({
-        error: 'overloaded',
-        message: e.message,
-        active: jobState.active,
-        queued: jobState.queue.length,
-      });
-    }
-    // Let the route's own error handling run if it already wrote a response.
-    // Otherwise respond here.
-    if (!res.headersSent) {
-      return res.status(500).json({ error: 'internal_error', message: e?.message || String(e) });
-    }
-  }
-};
-
-// Admin auth: use header x-admin-key or query ?key=
-function authenticateAdmin(req, res, next) {
-  const key = req.headers['x-admin-key'] || req.query.key;
-  if (!key || key !== ADMIN_SECRET) {
-    return res.status(401).send('Unauthorized');
-  }
-  next();
-}
-
-// Basic watchdog: if RSS exceeds threshold, exit so platform restarts container.
-if (MAX_RSS_MB > 0) {
-  setInterval(() => {
-    const rssMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    if (rssMb > MAX_RSS_MB) {
-      console.error(`[watchdog] RSS ${rssMb}MB exceeded MAX_RSS_MB=${MAX_RSS_MB}. Exiting for restart.`);
-      process.exit(1);
-    }
-  }, 5000).unref();
-}
-
 
 // Increase payload limit for large scenes
 app.use(express.json({ limit: '100mb' }));
@@ -449,171 +327,10 @@ app.get('/health', async (req, res) => {
   }
 });
 
-
-// -----------------------------------------------------------------------------
-// Simple monitoring page (HTML) + JSON status
-// -----------------------------------------------------------------------------
-app.get('/admin', authenticateAdmin, (req, res) => {
-  const key = req.query.key || '';
-  res.set('Content-Type', 'text/html; charset=utf-8');
-  res.send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>PDF Export Service • Status</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background: #0b1220; color: #e5e7eb; }
-    header { padding: 18px 20px; border-bottom: 1px solid rgba(148,163,184,.25); background: rgba(255,255,255,.03); position: sticky; top: 0; backdrop-filter: blur(10px); }
-    h1 { font-size: 16px; margin: 0; font-weight: 700; letter-spacing: .02em; }
-    .sub { color: #94a3b8; font-size: 12px; margin-top: 6px; }
-    main { padding: 20px; max-width: 1100px; margin: 0 auto; }
-    .grid { display: grid; gap: 14px; grid-template-columns: repeat(12, 1fr); }
-    .card { grid-column: span 12; background: rgba(255,255,255,.04); border: 1px solid rgba(148,163,184,.18); border-radius: 16px; padding: 14px 14px; }
-    @media (min-width: 900px) { .card.span6 { grid-column: span 6; } }
-    .k { color: #94a3b8; font-size: 12px; }
-    .v { font-size: 18px; font-weight: 700; margin-top: 4px; }
-    table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    th, td { text-align: left; padding: 8px 8px; border-bottom: 1px solid rgba(148,163,184,.14); vertical-align: top; }
-    th { color: #94a3b8; font-weight: 700; }
-    .ok { color: #34d399; font-weight: 700; }
-    .bad { color: #fb7185; font-weight: 700; }
-    .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; background: rgba(14,165,233,.12); border: 1px solid rgba(14,165,233,.25); font-size: 12px; color: #7dd3fc; }
-    .warn { background: rgba(251,146,60,.12); border-color: rgba(251,146,60,.25); color: #fdba74; }
-    .muted { color: #94a3b8; }
-    .row { display: flex; gap: 14px; flex-wrap: wrap; }
-    code { color: #a7f3d0; }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>PDF Export Service — Status</h1>
-    <div class="sub">Refreshes every 2s • Protect this URL (requires key)</div>
-  </header>
-  <main>
-    <div class="row">
-      <span id="healthPill" class="pill">● Loading…</span>
-      <span class="pill">Active jobs: <b id="active">0</b></span>
-      <span class="pill">Queued: <b id="queued">0</b></span>
-      <span class="pill warn">RSS: <b id="rss">0</b> MB</span>
-    </div>
-
-    <div class="grid" style="margin-top:14px;">
-      <div class="card span6">
-        <div class="k">Uptime</div>
-        <div class="v" id="uptime">—</div>
-        <div class="k" style="margin-top:10px;">Node</div>
-        <div class="v"><span id="node">—</span></div>
-        <div class="k" style="margin-top:10px;">Load avg</div>
-        <div class="v"><span id="load">—</span></div>
-      </div>
-
-      <div class="card span6">
-        <div class="k">Limits</div>
-        <div class="v"><span class="muted">MAX_CONCURRENT_JOBS</span> <code id="maxConc">—</code></div>
-        <div class="v"><span class="muted">MAX_JOB_QUEUE</span> <code id="maxQueue">—</code></div>
-        <div class="v"><span class="muted">JOB_TIMEOUT_MS</span> <code id="timeout">—</code></div>
-        <div class="v"><span class="muted">MAX_RSS_MB</span> <code id="maxRss">—</code></div>
-      </div>
-
-      <div class="card" style="grid-column: span 12;">
-        <div class="k">Recent jobs (newest first)</div>
-        <div style="margin-top:10px; overflow:auto;">
-          <table>
-            <thead><tr><th>At</th><th>Route</th><th>Duration</th><th>Result</th><th>Error</th></tr></thead>
-            <tbody id="recent"></tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  </main>
-
-<script>
-const KEY = ${JSON.stringify(key)};
-async function tick(){
-  try {
-    const r = await fetch('/admin/status?key=' + encodeURIComponent(KEY));
-    const j = await r.json();
-    document.getElementById('active').textContent = j.jobs.active;
-    document.getElementById('queued').textContent = j.jobs.queued;
-    document.getElementById('rss').textContent = j.process.memory.rssMb;
-    document.getElementById('uptime').textContent = j.process.uptimeHuman;
-    document.getElementById('node').textContent = j.process.node;
-    document.getElementById('load').textContent = j.process.loadavg.join(', ');
-    document.getElementById('maxConc').textContent = j.limits.maxConcurrentJobs;
-    document.getElementById('maxQueue').textContent = j.limits.maxJobQueue;
-    document.getElementById('timeout').textContent = j.limits.jobTimeoutMs;
-    document.getElementById('maxRss').textContent = j.limits.maxRssMb;
-
-    const pill = document.getElementById('healthPill');
-    if (j.ok) { pill.textContent = '● Healthy'; pill.className = 'pill'; }
-    else { pill.textContent = '● Degraded'; pill.className = 'pill warn'; }
-
-    const rows = (j.jobs.recent || []).map(x => {
-      const ok = x.ok ? '<span class="ok">OK</span>' : '<span class="bad">FAIL</span>';
-      const err = x.error ? String(x.error).slice(0,160) : '';
-      return '<tr>'
-        + '<td>' + x.at + '</td>'
-        + '<td><code>' + x.name + '</code></td>'
-        + '<td>' + x.ms + 'ms</td>'
-        + '<td>' + ok + '</td>'
-        + '<td class="muted">' + err + '</td>'
-        + '</tr>';
-    }).join('');
-    document.getElementById('recent').innerHTML = rows;
-  } catch (e) {
-    const pill = document.getElementById('healthPill');
-    pill.textContent = '● Error loading status';
-    pill.className = 'pill warn';
-  }
-}
-tick();
-setInterval(tick, 2000);
-</script>
-</body>
-</html>`);
-});
-
-app.get('/admin/status', authenticateAdmin, (req, res) => {
-  const mem = process.memoryUsage();
-  const rssMb = Math.round(mem.rss / 1024 / 1024);
-  const heapUsedMb = Math.round(mem.heapUsed / 1024 / 1024);
-  const heapTotalMb = Math.round(mem.heapTotal / 1024 / 1024);
-
-  const upSec = Math.floor(process.uptime());
-  const h = Math.floor(upSec / 3600);
-  const m = Math.floor((upSec % 3600) / 60);
-  const s = upSec % 60;
-
-  res.json({
-    ok: true,
-    at: nowIso(),
-    limits: {
-      maxConcurrentJobs: MAX_CONCURRENT_JOBS,
-      maxJobQueue: MAX_JOB_QUEUE,
-      jobTimeoutMs: JOB_TIMEOUT_MS,
-      maxRssMb: MAX_RSS_MB,
-    },
-    jobs: {
-      active: jobState.active,
-      queued: jobState.queue.length,
-      recent: jobState.recent,
-    },
-    process: {
-      pid: process.pid,
-      node: process.version,
-      uptimeSec: upSec,
-      uptimeHuman: `${h}h ${m}m ${s}s`,
-      loadavg: os.loadavg().map(n => Number(n.toFixed(2))),
-      memory: { rssMb, heapUsedMb, heapTotalMb },
-    },
-  });
-});
-
 // =============================================================================
 // VERIFY PDF — Diagnostic endpoint using Ghostscript to inspect PDF properties
 // =============================================================================
-app.post('/verify-pdf', authenticate, withCapacity('verify-pdf', async (req, res) => {
+app.post('/verify-pdf', authenticate, async (req, res) => {
   const jobId = uuidv4();
   const inputPath = path.join(TEMP_DIR, `${jobId}-verify.pdf`);
 
@@ -731,7 +448,7 @@ app.post('/verify-pdf', authenticate, withCapacity('verify-pdf', async (req, res
   } finally {
     fs.unlink(inputPath).catch(() => {});
   }
-}));
+});
 
 // =============================================================================
 // EXPORT MULTI-PAGE PDF — PDF-LIB CROP MARKS PIPELINE
@@ -740,7 +457,7 @@ app.post('/verify-pdf', authenticate, withCapacity('verify-pdf', async (req, res
 // Pass 2: pdf-lib draws crop marks in RGB + sets TrimBox/BleedBox
 // Pass 3: Ghostscript converts to CMYK (if requested)
 // =============================================================================
-app.post('/export-multipage', authenticate, withCapacity('export-multipage', async (req, res) => {
+app.post('/export-multipage', authenticate, async (req, res) => {
   const startTime = Date.now();
   const jobId = uuidv4();
   const vectorPath = path.join(TEMP_DIR, `${jobId}-vector.pdf`);
@@ -817,12 +534,12 @@ app.post('/export-multipage', authenticate, withCapacity('export-multipage', asy
     fs.unlink(boxedPath).catch(() => {});
     fs.unlink(cmykPath).catch(() => {});
   }
-}));
+});
 
 // =============================================================================
 // RENDER SINGLE VECTOR PDF — PDF-LIB CROP MARKS PIPELINE
 // =============================================================================
-app.post('/render-vector', authenticate, withCapacity('render-vector', async (req, res) => {
+app.post('/render-vector', authenticate, async (req, res) => {
   const startTime = Date.now();
   const jobId = uuidv4();
   const vectorPath = path.join(TEMP_DIR, `${jobId}-vector.pdf`);
@@ -888,12 +605,12 @@ app.post('/render-vector', authenticate, withCapacity('render-vector', async (re
     fs.unlink(boxedPath).catch(() => {});
     fs.unlink(cmykPath).catch(() => {});
   }
-}));
+});
 
 // =============================================================================
 // BATCH RENDER VECTOR PDFs (returns base64) — PDF-LIB CROP MARKS PIPELINE
 // =============================================================================
-app.post('/batch-render-vector', authenticate, withCapacity('batch-render-vector', async (req, res) => {
+app.post('/batch-render-vector', authenticate, async (req, res) => {
   const startTime = Date.now();
   const { scenes, options = {} } = req.body;
 
@@ -965,12 +682,12 @@ app.post('/batch-render-vector', authenticate, withCapacity('batch-render-vector
   console.log(`[batch] Complete: ${successful}/${scenes.length} in ${Date.now() - startTime}ms`);
 
   res.json({ total: scenes.length, successful, results });
-}));
+});
 
 // =============================================================================
 // EXPORT LABELS WITH IMPOSITION — PDF-LIB CROP MARKS + TILING
 // =============================================================================
-app.post('/export-labels', authenticate, withCapacity('export-labels', async (req, res) => {
+app.post('/export-labels', authenticate, async (req, res) => {
   const startTime = Date.now();
   const jobId = uuidv4();
   const vectorPath = path.join(TEMP_DIR, `${jobId}-vector.pdf`);
@@ -1048,12 +765,12 @@ app.post('/export-labels', authenticate, withCapacity('export-labels', async (re
     fs.unlink(cmykPath).catch(() => {});
     fs.unlink(imposedPath).catch(() => {});
   }
-}));
+});
 
 // =============================================================================
 // COMPOSE PDFs (merge multiple PDFs preserving vectors)
 // =============================================================================
-app.post('/compose-pdfs', authenticate, withCapacity('compose-pdfs', async (req, res) => {
+app.post('/compose-pdfs', authenticate, async (req, res) => {
   const startTime = Date.now();
   const jobId = uuidv4();
   const outputPath = path.join(TEMP_DIR, `${jobId}-composed.pdf`);
@@ -1095,20 +812,20 @@ app.post('/compose-pdfs', authenticate, withCapacity('compose-pdfs', async (req,
     }
     fs.unlink(outputPath).catch(() => {});
   }
-}));
+});
 
 // =============================================================================
 // LEGACY ENDPOINTS (kept for backward compatibility)
 // =============================================================================
-app.post('/render', authenticate, withCapacity('render', async (req, res) => {
+app.post('/render', authenticate, async (req, res) => {
   req.url = '/render-vector';
   return app._router.handle(req, res);
-}));
+});
 
-app.post('/batch-render', authenticate, withCapacity('batch-render', async (req, res) => {
+app.post('/batch-render', authenticate, async (req, res) => {
   req.url = '/batch-render-vector';
   return app._router.handle(req, res);
-}));
+});
 
 // =============================================================================
 // START SERVER
