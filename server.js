@@ -729,12 +729,10 @@ app.post('/export-labels', authenticate, async (req, res) => {
       includeBleed: bleedPx > 0,
     });
 
-    // Pass 2: pdf-lib crop marks + TrimBox/BleedBox on individual labels
+    // Pass 2: Skip crop marks for labels with imposition — marks on individual
+    // labels would be destroyed when tiled onto sheets. The pipeline becomes:
+    // Polotno (with bleed) → Impose onto sheets → Optional CMYK.
     let currentPath = vectorPath;
-    if (bleedMm > 0 || wantCropMarks) {
-      await addCropMarksAndBoxes(currentPath, bleedMm, boxedPath);
-      currentPath = boxedPath;
-    }
 
     // Step 3: Impose labels onto sheets
     console.log(`[${jobId}] Imposing labels onto sheets`);
